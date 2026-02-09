@@ -25,3 +25,45 @@ Thumbs.db
 .mp4
 .mov
 .pdf
+
+# Node / frontend
+node_modules/
+dist/
+build/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python additional
+.mypy_cache/
+.pytest_cache/
+pip-wheel-metadata/
+*.egg-info/
+env/
+ENV/
+.env
+
+# C / build artifacts
+*.o
+*.so
+*.exe
+*.out
+*.a
+*.obj
+*.elf
+
+# Editor/IDE
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Logs and runtime files
+*.log
+logs/
+core
+
+# Temporary files
+*.swp
+*~
+.#*
