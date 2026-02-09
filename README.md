@@ -1,58 +1,60 @@
+gcc -O2 match.c -o match
 # badapplestein
 
-A compact working area for SteinLine-related experiments, helpers and tooling: Python job scripts for arrangement/rendering, small C utilities, and assorted support files used while developing and analyzing SteinLine layouts.
+Standalone experiments and utilities for layout arrangement and rendering.
 
-**Project Overview**
-- **Purpose:** Collection of tools and experiment scripts used while developing layout/arrangement algorithms and renderers for the SteinLine project.
-- **Languages:** Python (primary), C (small utilities / performance-critical parts), HTML/JS (frontend in sibling folders).
+This folder is an independent project: the Python scripts and C utilities here are self-contained and are not tied to other workspace folders. Use this repository for quick experiments, algorithm prototypes, and small performance tools.
 
-**Repository Layout (key files in this folder)**
-- `job1_arrange.py`, `job1_greedy_arrange.py`, `job1_hyper_arrange.py` : arrangement experiment scripts.
-- `job2_render.py`, `job2_renderfast.py`, `job2_greedy_render.py` : rendering experiments.
-- `job2_stage1_pack.py`, `job2_stage2_turbo.py` : packing / pipeline stage scripts.
-- `dedupe`, `dedupe.c`, `match.c` : small C utilities / tools used by experiments.
-- `last_project.json` : local project snapshot (ignored by git).
+Project highlights
+- Purpose: run and iterate arrangement/render experiments and tiny C helpers.
+- Languages: Python (experiments & orchestration) and C (small, fast utilities).
+- Status: experimental — many scripts are prototypes meant for local runs.
 
-**Quick Start**
+Repository layout (important files)
+- `job1_arrange.py`, `job1_greedy_arrange.py`, `job1_hyper_arrange.py` — arrangement experiment scripts.
+- `job2_render.py`, `job2_renderfast.py`, `job2_greedy_render.py` — rendering experiments.
+- `job2_stage1_pack.py`, `job2_stage2_turbo.py` — packing / pipeline stages.
+- `dedupe`, `dedupe.c`, `match.c` — small C utilities; source and optionally built binaries.
+- `last_project.json` — local snapshot used by scripts (already ignored by git).
 
-Prerequisites: Python 3.8+ and a C toolchain (gcc/clang) for building utilities.
+Quick start
 
-1. Create and activate a virtual environment:
+1) Create and activate a Python virtual environment:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-2. Install Python dependencies (if any). There is a top-level `requirements.txt` in the workspace; some subfolders may have their own requirements.
+2) (Optional) Install dependencies if a `requirements.txt` is present for your use-case.
 
 ```bash
-# from this folder or repo root
 pip install -r requirements.txt || true
 ```
 
-3. Run an example arrangement script:
-
-```bash
-python3 job1_arrange.py
-```
-
-4. Build C utilities (if needed):
+3) Build the C utilities (if you need the native binaries):
 
 ```bash
 gcc -O2 dedupe.c -o dedupe
 gcc -O2 match.c -o match
 ```
 
-**Development notes**
-- Many scripts are quick experiments — check headers and `--help` for script-specific options.
-- Avoid committing large binary/model files; this repo's `.gitignore` already excludes common artifacts (virtual envs, model caches, node_modules, build artifacts, etc.).
+4) Run a sample script:
 
-**Where to look next**
-- The main application and broader project live in sibling folders: `steinline/`, `stein-server/`, `stein-line/` and `Project-SteinLine/`.
+```bash
+python3 job1_arrange.py
+```
 
-**License**
-- See the repository `LICENSE` at the workspace root for license terms.
+Conventions & notes
+- Scripts are experimental — read the top-of-file usage comments and flags.
+- `last_project.json` and model caches are intentionally ignored in `.gitignore`.
+- Avoid committing large models, datasets, or build artifacts.
 
-**Contact / Maintainer**
-- See top-level project metadata or reach the workspace owner for more context on running experiments and expected environments.
+Troubleshooting
+- If a script fails with missing dependency errors, check for a `requirements.txt` in the repo root or inspect the script imports and install the required packages into the active virtualenv.
+
+License
+- See the workspace `LICENSE` for terms.
+
+Maintainer
+- Contact the workspace owner for questions about intended experiment inputs, expected outputs, or integration with other tools.
