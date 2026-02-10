@@ -30,13 +30,4 @@ Below is the demonstration of your version of the project (hosted on YouTube). T
 - `job2_*.py` — rendering scripts that assemble the final output.
 - `library.pkl` — precomputed index or library used for matching (if present).
 
-## Notes
-
-- This README intentionally omits setup and build instructions due to the project's complex dependencies and platform-specific build steps.
-- The `badapple.mp4` file present in the repo is the original classic Bad Apple video; the YouTube embed above points to your project build.
-
----
-
-If you'd like, I can add a gallery of still frames or a small GIF for the README (smaller files are generally friendlier on GitHub). Let me know and I'll add them.
-
 

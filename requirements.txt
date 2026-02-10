@@ -1,0 +1,6 @@
+
+numpy
+opencv-python
+pypdfium2
+tqdm
+imageio-ffmpeg
