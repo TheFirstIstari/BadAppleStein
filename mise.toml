@@ -1,0 +1,259 @@
+# BadAppleStein - Mise task runner configuration (standalone)
+# Generalized pipeline: arrange (C matcher) -> render (video assembly)
+
+[tools]
+python = "3.12"
+
+[tasks.setup]
+description = "Install Python dependencies"
+run = "pip install -r requirements.txt"
+sources = ["requirements.txt"]
+outputs = { auto = true }
+
+# Legacy C matcher library (kept for benchmark-c and reference)
+[tasks.build-c]
+description = "Build the legacy C matching library (unused by default, kept for benchmark-c)"
+run = '''
+CFLAGS="-O3 -march=native -funroll-loops -shared -fPIC"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    OMP_PREFIX="$(brew --prefix libomp 2>/dev/null)"
+    if [[ -n "$OMP_PREFIX" && -d "$OMP_PREFIX" ]]; then
+        clang $CFLAGS -Xpreprocessor -fopenmp \
+            -I"$OMP_PREFIX/include" -L"$OMP_PREFIX/lib" -lomp \
+            -o libmatch.dylib match.c && echo "Built libmatch.dylib (OpenMP)"
+    else
+        clang $CFLAGS -o libmatch.dylib match.c && echo "Built libmatch.dylib (single-threaded)"
+    fi
+else
+    gcc $CFLAGS -fopenmp -o libmatch.so match.c && echo "Built libmatch.so (OpenMP)" || \
+    gcc $CFLAGS -o libmatch.so match.c && echo "Built libmatch.so (single-threaded)"
+fi
+'''
+
+# Build the library from source PDFs/images (or convert existing library.pkl)
+[tasks.build-library]
+description = "Build library from source PDFs/images (or converts library.pkl)"
+run = "python build_library.py Epstein 2>/dev/null || python convert_library.py 2>/dev/null || python build_library.py ."
+depends = ["setup"]
+
+[tasks.build-arrange]
+description = "Compile arrangement engine (pure C, libav, OpenMP matcher)"
+run = '''
+set -e
+
+# Detect ffmpeg/libav flags — try pkg-config first, then common paths
+AVFLAGS="$(PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/opt/homebrew/Cellar/ffmpeg/8.1.2_1/lib/pkgconfig:/opt/homebrew/lib/pkgconfig" \
+    pkg-config --cflags --libs libavformat libavcodec libavutil libswscale 2>/dev/null)" || true
+if [[ -z "$AVFLAGS" ]]; then
+    if [[ -d "/opt/homebrew/include/libavformat" ]]; then
+        AVFLAGS="-I/opt/homebrew/include -L/opt/homebrew/lib -lavformat -lavcodec -lavutil -lswscale"
+    elif [[ -d "/usr/local/include/libavformat" ]]; then
+        AVFLAGS="-I/usr/local/include -L/usr/local/lib -lavformat -lavcodec -lavutil -lswscale"
+    else
+        echo "[ERROR] ffmpeg/libav not found. Install with: brew install ffmpeg"
+        exit 1
+    fi
+fi
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    OMP_PREFIX="$(brew --prefix libomp 2>/dev/null)"
+    if [[ -n "$OMP_PREFIX" && -d "$OMP_PREFIX" ]]; then
+        clang -O3 -march=native -funroll-loops -Xpreprocessor -fopenmp \
+            -I"$OMP_PREFIX/include" -L"$OMP_PREFIX/lib" -lomp \
+            $AVFLAGS arrange.c match.c imgops.c video.c cli.c -lm -o arrange
+    else
+        echo "[WARN] libomp not found — building without OpenMP (single-threaded matching)"
+        clang -O3 -march=native -funroll-loops \
+            $AVFLAGS arrange.c match.c imgops.c video.c cli.c -lm -o arrange
+    fi
+else
+    gcc -O3 -march=native -funroll-loops -fopenmp \
+        $AVFLAGS arrange.c match.c imgops.c video.c cli.c -lm -o arrange
+fi
+echo "Built ./arrange"
+'''
+depends = ["setup"]
+
+[tasks.build-render]
+description = "Compile render engine (pure C, libav, mupdf)"
+run = '''
+set -e
+AVFLAGS="$(PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/opt/homebrew/Cellar/ffmpeg/8.1.2_1/lib/pkgconfig:/opt/homebrew/lib/pkgconfig" \
+    pkg-config --cflags --libs libavformat libavcodec libavutil libswscale 2>/dev/null)" || true
+if [[ -z "$AVFLAGS" ]]; then
+    if [[ -d "/opt/homebrew/include/libavformat" ]]; then
+        AVFLAGS="-I/opt/homebrew/include -L/opt/homebrew/lib -lavformat -lavcodec -lavutil -lswscale"
+    elif [[ -d "/usr/local/include/libavformat" ]]; then
+        AVFLAGS="-I/usr/local/include -L/usr/local/lib -lavformat -lavcodec -lavutil -lswscale"
+    else
+        echo "[ERROR] ffmpeg/libav not found. Install with: brew install ffmpeg"
+        exit 1
+    fi
+fi
+MUPDF_FLAGS="$(pkg-config --cflags --libs mupdf 2>/dev/null || true)"
+if [[ -z "$MUPDF_FLAGS" ]]; then
+    # Homebrew fallback (mupdf ships no .pc file)
+    MUPDF_PREFIX="$(brew --prefix mupdf 2>/dev/null || true)"
+    if [[ -n "$MUPDF_PREFIX" && -d "$MUPDF_PREFIX/include/mupdf" ]]; then
+        MUPDF_FLAGS="-I$MUPDF_PREFIX/include -L$MUPDF_PREFIX/lib -lmupdf -lmupdf-third"
+    fi
+fi
+if [[ -n "$MUPDF_FLAGS" ]]; then
+    clang -O3 -march=native -funroll-loops \
+        $AVFLAGS $MUPDF_FLAGS render.c pdf.c video.c imgops.c cli.c -lm -DHAVE_MUPDF -o render
+else
+    echo "[WARN] mupdf not found — building render without PDF support (install with: brew install mupdf)"
+    clang -O3 -march=native -funroll-loops \
+        $AVFLAGS render.c pdf.c video.c imgops.c cli.c -lm -o render
+fi
+echo "Built ./render"
+'''
+depends = ["setup"]
+
+[tasks.arrange-py]
+description = "Reference: original Python arrange (job1)"
+run = "python job1_greedy_arrange.py"
+depends = ["setup", "build-c"]
+
+[tasks.arrange]
+description = "Stage 1 (C): Analyze video frames and match to source library"
+run = '''
+VIDEO="${1:-../badapple.mp4}"
+shift 2>/dev/null || true
+FEAT="${MISE_FEATURES:-features.bin}"
+REG="${MISE_REGISTRY:-registry.bin}"
+MAN="${MISE_MANIFESTS:-manifests_greedy}"
+./arrange --video "$VIDEO" --features "$FEAT" --registry "$REG" --manifests "$MAN" "$@"
+'''
+depends = ["build-arrange"]
+
+[tasks.render]
+description = "Stage 2: Render final video from manifests (grayscale, needs mupdf)"
+run = '''
+MAN="${MISE_MANIFESTS:-manifests_greedy}"
+REG="${MISE_REGISTRY:-registry.bin}"
+W="${MISE_WIDTH:-7680}"
+H="${MISE_HEIGHT:-4320}"
+FPS="${MISE_FPS:-60}"
+OUT="${MISE_OUTPUT:-Bad_Apple_8K_YOUTUBE.mov}"
+./render --manifests "$MAN" --registry "$REG" --output "$OUT" --width "$W" --height "$H" --fps "$FPS" "$@"
+'''
+depends = ["build-render"]
+
+[tasks.run]
+description = "Run full pipeline: arrange then render"
+depends = ["arrange", "render"]
+
+[tasks.test]
+description = "Clean, build, and run a quick test (50 frames)"
+run = '''
+set -e
+VIDEO="${1:-../badapple.mp4}"
+LIB="${2:-test_lib}"
+shift 2 2>/dev/null || true
+
+echo "--- test: clean ---"
+rm -rf manifests_greedy/ atlas_cache/ *.mov
+
+echo "--- test: build arrange ---"
+mise run build-arrange
+
+echo "--- test: arrange (50 frames) ---"
+MISE_FEATURES="$LIB/features.bin" MISE_REGISTRY="$LIB/registry.bin" \
+    ./arrange --video "$VIDEO" --features "$LIB/features.bin" \
+    --registry "$LIB/registry.bin" --manifests manifests_greedy --max-frames 50 "$@"
+
+echo "--- test: build render ---"
+mise run build-render
+
+echo "--- test: render (50 frames) ---"
+MISE_REGISTRY="$LIB/registry.bin" \
+    ./render --manifests manifests_greedy --registry "$LIB/registry.bin" \
+    --output test_output.mov --width 7680 --height 4320 --fps 60 \
+    --max-frames 50 "$@"
+
+echo "--- test: output ---"
+ls -lh test_output.mov
+echo "--- test: PASSED ---"
+'''
+
+[tasks.gen-lib]
+description = "Generate a test library with random features, registry, and PDF"
+run = "python3 gen_test_lib.py ${@:---pages 200 --seed 42 --output test_lib}"
+
+[tasks.benchmark-arrange]
+description = "Benchmark stage 1 (arrangement) with timing"
+run = "hyperfine --warmup 1 './arrange --video ../badapple.mp4 --max-frames 200' --export-json benchmark-arrange.json"
+depends = ["build-arrange"]
+
+[tasks.benchmark-render]
+description = "Benchmark stage 2 (rendering) with timing"
+run = "hyperfine --warmup 1 'python job2_greedy_render.py' --export-json benchmark-render.json"
+depends = ["render"]
+
+[tasks.clean]
+description = "Remove generated artifacts (manifests, cache, output)"
+run = "rm -rf manifests_greedy/ atlas_cache/ Bad_Apple_8K_YOUTUBE.mov temp_master.mov benchmark-*.json"
+
+[tasks.clean-all]
+description = "Remove all generated artifacts including library cache"
+run = "rm -rf manifests_greedy/ atlas_cache/ library.pkl features.bin registry.bin *.mov *.json arrange"
+
+[tasks.verify]
+description = "Verify C library is built and scripts can import dependencies"
+run = '''
+python -c "import cv2, numpy, pypdfium2, tqdm; print('Python deps OK')"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    test -f arrange && echo "arrange found" || echo "arrange missing - run build-arrange"
+else
+    test -f arrange && echo "arrange found" || echo "arrange missing - run build-arrange"
+fi
+'''
+
+[tasks.inspect-library]
+description = "Show library.pkl stats and referenced PDF paths"
+run = '''
+python -c "
+import pickle, os
+if os.path.exists('library.pkl'):
+    registry, signatures = pickle.load(open('library.pkl', 'rb'))
+    print(f'Library: {len(registry)} pages, {len(signatures)} signatures')
+    unique_dirs = set(os.path.dirname(p) if os.path.dirname(p) else '.' for p, i in registry)
+    print(f'PDF directories referenced: {unique_dirs}')
+    print(f'Sample paths: {list(registry[:3])}')
+    missing = sum(1 for p, i in registry if not os.path.exists(p))
+    print(f'Missing PDF files: {missing}/{len(registry)}')
+else:
+    print('library.pkl not found - need to run library preparation')
+"
+'''
+
+[tasks.benchmark-c]
+description = "Micro-benchmark C match_batch function (new L1 matcher)"
+run = '''
+python -c "
+import ctypes, numpy as np, os, time
+lib_path = 'libmatch.dylib' if os.path.exists('libmatch.dylib') else 'libmatch.so'
+if os.path.exists(lib_path):
+    lib = ctypes.CDLL(lib_path)
+    lib.match_batch.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64), 
+                                ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+    n_pages, n_targets = 1000, 1000
+    lib_data = np.random.randint(0, 2**64, (n_pages, 64), dtype=np.uint64)
+    targets = np.random.randint(0, 2**64, (n_targets, 64), dtype=np.uint64)
+    results = np.zeros(n_targets, dtype=np.int32)
+    lib.match_batch(lib_data.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+                    targets.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+                    n_pages, n_targets,
+                    results.ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
+    start = time.perf_counter()
+    lib.match_batch(lib_data.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+                    targets.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+                    n_pages, n_targets,
+                    results.ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
+    elapsed = time.perf_counter() - start
+    print(f'Legacy C matcher: {n_pages}x{n_targets} pairs in {elapsed:.3f}s = {n_targets/elapsed:.1f} matches/sec')
+else:
+    print('Legacy libmatch not found')
+"
+'''

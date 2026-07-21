@@ -26,6 +26,24 @@ Thumbs.db
 .mov
 .pdf
 
+# Binary data files
+*.bin
+
+# Compiled / built artifacts
+arrange
+render
+libmatch.dylib
+libmatch.so
+
+# Generated output directories
+manifests_greedy/
+atlas_cache/
+test_lib/
+test_output.mov
+
+# Output videos
+*.mov
+
 # Node / frontend
 node_modules/
 dist/
@@ -46,6 +64,7 @@ ENV/
 # C / build artifacts
 *.o
 *.so
+*.dylib
 *.exe
 *.out
 *.a
@@ -67,3 +86,6 @@ core
 *.swp
 *~
 .#*
+
+# Benchmarks
+benchmark-*.json
