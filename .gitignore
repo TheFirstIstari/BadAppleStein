@@ -38,6 +38,7 @@ test_lib/
 
 # Test output
 test_output.mov
+test_output.mp4
 
 # Logs
 *.log

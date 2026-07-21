@@ -12,6 +12,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <unistd.h>
 
 struct VideoDecoder {
     AVFormatContext *fmt;
@@ -202,6 +203,7 @@ VideoEncoder *video_encoder_open(const char *path, int w, int h, double fps,
 
     const AVOutputFormat *ofmt = av_guess_format(NULL, path, NULL);
     if (!ofmt && codec_name) ofmt = av_guess_format(codec_name, NULL, NULL);
+    if (!ofmt) ofmt = av_guess_format("mp4", NULL, NULL);  /* fallback to mp4 */
     if (!ofmt) { free(ve); return NULL; }
     if (avformat_alloc_output_context2(&ve->fmt, (AVOutputFormat *)ofmt, NULL, path) < 0) { free(ve); return NULL; }
 
@@ -216,6 +218,26 @@ VideoEncoder *video_encoder_open(const char *path, int w, int h, double fps,
     ve->ctx->time_base = (AVRational){1, (int)(fps > 0 ? fps : 30)};
     if (ve->fmt->oformat->flags & AVFMT_GLOBALHEADER)
         ve->ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    /* Detect hardware vs software codec and configure accordingly.
+     * Hardware encoders (VideoToolbox, VAAPI) handle threading internally.
+     * Software encoders (ProRes) benefit from slice-level multi-threading. */
+    {
+        int is_hw = (strstr(codec_name ? codec_name : "", "videotoolbox") ||
+                     strstr(codec_name ? codec_name : "", "vaapi") ||
+                     strstr(codec_name ? codec_name : "", "nvenc") ||
+                     strstr(codec_name ? codec_name : "", "amf"));
+        if (is_hw) {
+            /* Hardware encoder: no manual threading, set quality */
+            av_opt_set_double(ve->ctx->priv_data, "q", 80.0, 0);
+        } else {
+            /* Software encoder: enable slice-level multi-threading */
+            long ncores = sysconf(_SC_NPROCESSORS_ONLN);
+            if (ncores < 1) ncores = 1;
+            ve->ctx->thread_count = (int)ncores;
+            ve->ctx->thread_type = FF_THREAD_SLICE;
+        }
+    }
 
     if (avcodec_open2(ve->ctx, ve->codec, NULL) < 0) { avcodec_free_context(&ve->ctx); avformat_free_context(ve->fmt); free(ve); return NULL; }
 
@@ -302,6 +324,26 @@ void video_encoder_close(VideoEncoder *ve) {
     avcodec_free_context(&ve->ctx);
     avformat_free_context(ve->fmt);
     free(ve);
+}
+
+/* Probe for hardware-accelerated encoders. Returns best available codec name or NULL. */
+const char *video_probe_hw_encoder(void) {
+    /* Preference order: HEVC first (better compression), then H.264 */
+    static const char *hw_codecs[] = {
+#if defined(__APPLE__)
+        "hevc_videotoolbox",
+        "h264_videotoolbox",
+#elif defined(__linux__)
+        "hevc_vaapi",
+        "h264_vaapi",
+#endif
+        NULL
+    };
+    for (int i = 0; hw_codecs[i]; i++) {
+        const AVCodec *c = avcodec_find_encoder_by_name(hw_codecs[i]);
+        if (c) return hw_codecs[i];
+    }
+    return NULL;
 }
 
 #ifdef __cplusplus

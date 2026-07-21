@@ -168,9 +168,13 @@ int main(int argc, char **argv) {
                     feat_push(&fb, feat, feat_len);
                     free(feat);
                     if (nreg >= cap) {
-                        cap = cap ? cap * 2 : 256;
-                        paths = realloc(paths, (size_t)cap * sizeof(char *));
-                        page_idxs = realloc(page_idxs, (size_t)cap * sizeof(int));
+                        int ncap = cap ? cap * 2 : 256;
+                        char **new_paths = realloc(paths, (size_t)ncap * sizeof(char *));
+                        int *new_idxs = realloc(page_idxs, (size_t)ncap * sizeof(int));
+                        if (!new_paths || !new_idxs) { free(new_paths); free(new_idxs); free(feat); cli_die("out of memory"); }
+                        paths = new_paths;
+                        page_idxs = new_idxs;
+                        cap = ncap;
                     }
                     paths[nreg] = strdup(full);
                     page_idxs[nreg] = pg;
@@ -200,9 +204,13 @@ int main(int argc, char **argv) {
                 feat_push(&fb, feat, feat_len);
                 free(feat);
                 if (nreg >= cap) {
-                    cap = cap ? cap * 2 : 256;
-                    paths = realloc(paths, (size_t)cap * sizeof(char *));
-                    page_idxs = realloc(page_idxs, (size_t)cap * sizeof(int));
+                    int ncap = cap ? cap * 2 : 256;
+                    char **new_paths = realloc(paths, (size_t)ncap * sizeof(char *));
+                    int *new_idxs = realloc(page_idxs, (size_t)ncap * sizeof(int));
+                    if (!new_paths || !new_idxs) { free(new_paths); free(new_idxs); free(feat); cli_die("out of memory"); }
+                    paths = new_paths;
+                    page_idxs = new_idxs;
+                    cap = ncap;
                 }
                 paths[nreg] = strdup(full);
                 page_idxs[nreg] = -1;

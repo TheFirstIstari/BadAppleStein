@@ -1,5 +1,7 @@
 # BadAppleStein - Mise task runner configuration (standalone)
 # Generalized pipeline: arrange (C matcher) -> render (video assembly)
+# A general tool for matching any input video to any set of source PDFs/images.
+# Run from project root: mise run arrange
 
 [tools]
 python = "3.12"
@@ -42,7 +44,7 @@ echo "Built ./arrange"
 '''
 
 [tasks.build-render]
-description = "Compile render engine (pure C, libav, mupdf)"
+description = "Compile render engine (pure C, libav, mupdf, OpenMP)"
 run = '''
 set -e
 AVFLAGS="$(PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/opt/homebrew/Cellar/ffmpeg/8.1.2_1/lib/pkgconfig:/opt/homebrew/lib/pkgconfig" \
@@ -65,40 +67,39 @@ if [[ -z "$MUPDF_FLAGS" ]]; then
         MUPDF_FLAGS="-I$MUPDF_PREFIX/include -L$MUPDF_PREFIX/lib -lmupdf -lmupdf-third"
     fi
 fi
+RENDER_SRC="render.c pdf.c video.c system_detect.c imgops.c cli.c"
+VT_FLAGS=""
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    OMP_PREFIX="$(brew --prefix libomp 2>/dev/null)"
+    if [[ -n "$OMP_PREFIX" && -d "$OMP_PREFIX" ]]; then
+        OMP_FLAGS="-Xpreprocessor -fopenmp -I$OMP_PREFIX/include -L$OMP_PREFIX/lib -lomp"
+    else
+        OMP_FLAGS=""
+        echo "[WARN] libomp not found — building render without OpenMP"
+    fi
+    VT_FLAGS="vt_prores.m -fobjc-arc -framework Foundation -framework AVFoundation -framework CoreMedia -framework CoreVideo"
+else
+    OMP_FLAGS="-fopenmp"
+fi
 if [[ -n "$MUPDF_FLAGS" ]]; then
-    clang -O3 -march=native -funroll-loops \
-        $AVFLAGS $MUPDF_FLAGS render.c pdf.c video.c imgops.c cli.c -lm -DHAVE_MUPDF -o render
+    clang -O3 -march=native -funroll-loops $OMP_FLAGS \
+        $AVFLAGS $MUPDF_FLAGS $RENDER_SRC $VT_FLAGS -lm -DHAVE_MUPDF -o render
 else
     echo "[WARN] mupdf not found — building render without PDF support (install with: brew install mupdf)"
-    clang -O3 -march=native -funroll-loops \
-        $AVFLAGS render.c pdf.c video.c imgops.c cli.c -lm -o render
+    clang -O3 -march=native -funroll-loops $OMP_FLAGS \
+        $AVFLAGS $RENDER_SRC $VT_FLAGS -lm -o render
 fi
 echo "Built ./render"
 '''
 
 [tasks.arrange]
 description = "Stage 1 (C): Analyze video frames and match to source library"
-run = '''
-VIDEO="${1:-../badapple.mp4}"
-shift 2>/dev/null || true
-FEAT="${MISE_FEATURES:-features.bin}"
-REG="${MISE_REGISTRY:-registry.bin}"
-MAN="${MISE_MANIFESTS:-manifests_greedy}"
-./arrange --video "$VIDEO" --features "$FEAT" --registry "$REG" --manifests "$MAN" "$@"
-'''
+run = "cd BadAppleStein && ./arrange --video ../badapple.mp4 --scale 15"
 depends = ["build-arrange"]
 
 [tasks.render]
 description = "Stage 2: Render final video from manifests (grayscale, needs mupdf)"
-run = '''
-MAN="${MISE_MANIFESTS:-manifests_greedy}"
-REG="${MISE_REGISTRY:-registry.bin}"
-W="${MISE_WIDTH:-7680}"
-H="${MISE_HEIGHT:-4320}"
-FPS="${MISE_FPS:-60}"
-OUT="${MISE_OUTPUT:-Bad_Apple_8K_YOUTUBE.mov}"
-./render --manifests "$MAN" --registry "$REG" --output "$OUT" --width "$W" --height "$H" --fps "$FPS" "$@"
-'''
+run = "cd BadAppleStein && ./render --manifests manifests_greedy --registry registry.bin --output Bad_Apple_8K_YOUTUBE.mov --width 7680 --height 4320 --fps 60"
 depends = ["build-render"]
 
 [tasks.run]
@@ -107,6 +108,7 @@ depends = ["arrange", "render"]
 
 [tasks.test]
 description = "Clean, build, and run a quick test (50 frames)"
+depends = ["gen-lib", "build-arrange", "build-render"]
 run = '''
 set -e
 VIDEO="${1:-../badapple.mp4}"
@@ -114,7 +116,7 @@ LIB="${2:-test_lib}"
 shift 2 2>/dev/null || true
 
 echo "--- test: clean ---"
-rm -rf manifests_greedy/ atlas_cache/ *.mov
+rm -rf manifests_greedy/ *.mov *.mp4
 
 echo "--- test: build arrange ---"
 mise run build-arrange
@@ -130,16 +132,16 @@ mise run build-render
 echo "--- test: render (50 frames) ---"
 MISE_REGISTRY="$LIB/registry.bin" \
     ./render --manifests manifests_greedy --registry "$LIB/registry.bin" \
-    --output test_output.mov --width 7680 --height 4320 --fps 60 \
+    --output test_output --width 7680 --height 4320 --fps 60 \
     --max-frames 50 "$@"
 
 echo "--- test: output ---"
-ls -lh test_output.mov
+ls -lh test_output.*
 echo "--- test: PASSED ---"
 '''
 
 [tasks.gen-lib]
-description = "Generate a test library with random features, registry, and PDF"
+description = "Generate a test library with meaningful visual patterns, registry, and images"
 run = "python3 gen_test_lib.py ${@:---pages 200 --seed 42 --output test_lib}"
 
 [tasks.benchmark-arrange]
@@ -154,8 +156,8 @@ depends = ["build-render"]
 
 [tasks.clean]
 description = "Remove generated artifacts (manifests, cache, output)"
-run = "rm -rf manifests_greedy/ atlas_cache/ Bad_Apple_8K_YOUTUBE.mov temp_master.mov benchmark-*.json"
+run = "rm -rf manifests_greedy/ *.mov *.mp4 benchmark-*.json"
 
 [tasks.clean-all]
 description = "Remove all generated artifacts including library cache"
-run = "rm -rf manifests_greedy/ atlas_cache/ library.pkl features.bin registry.bin *.mov *.json arrange"
+run = "rm -rf manifests_greedy/ library.pkl features.bin registry.bin *.mov *.json arrange"

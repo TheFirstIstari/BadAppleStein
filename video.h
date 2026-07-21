@@ -33,6 +33,12 @@ void video_decoder_close(VideoDecoder *vd);
 
 typedef struct VideoEncoder VideoEncoder;
 
+/* Probe for hardware-accelerated encoders.
+ * Returns the name of the best available HW encoder, or NULL if none found.
+ * Examples: "hevc_videotoolbox" (macOS), "hevc_vaapi" (Linux).
+ * Caller should fall back to software (e.g. "prores_ks") when NULL. */
+const char *video_probe_hw_encoder(void);
+
 /* Open an encoder writing to `path`. `w`,`h` are the output frame size in
  * pixels; `fps` the frame rate; `pix_fmt_name` e.g. "yuv422p10le" or "gray". */
 VideoEncoder *video_encoder_open(const char *path, int w, int h, double fps,
