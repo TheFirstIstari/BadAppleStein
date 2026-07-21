@@ -201,7 +201,10 @@ int main(int argc, char **argv) {
         char fn[1024]; snprintf(fn, sizeof(fn), "%s/%04d.bin", man_dir, fi);
         FILE *f = fopen(fn, "wb");
         if (f) {
+            uint32_t src_w = (uint32_t)fw, src_h = (uint32_t)fh;
             uint32_t nn = (uint32_t)n;
+            fwrite(&src_w, 4, 1, f);
+            fwrite(&src_h, 4, 1, f);
             fwrite(&nn, 4, 1, f);
             for (int k = 0; k < n; k++) {
                 int32_t b[6] = {manifest[k].x, manifest[k].y, manifest[k].w, manifest[k].h,

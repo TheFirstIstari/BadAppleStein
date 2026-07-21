@@ -50,24 +50,45 @@ static int cmp_manifest(const void *a, const void *b) {
     return strcmp(*(const char **)a, *(const char **)b);
 }
 
-static int load_manifest(const char *path, Inst **out, int *nout) {
+static int load_manifest(const char *path, Inst **out, int *nout,
+                         int target_w, int target_h) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz < 4) { fclose(f); return -1; }
+    if (sz < 12) { fclose(f); return -1; }
 
-    uint32_t n = 0;
+    uint32_t src_w = 0, src_h = 0, n = 0;
+    fread(&src_w, 4, 1, f);
+    fread(&src_h, 4, 1, f);
     fread(&n, 4, 1, f);
     if (n > MAX_INSTS) { fclose(f); return -1; }
+
+    /* Compute uniform scale with center-crop to fill output canvas */
+    double scale = 1.0, ox = 0.0, oy = 0.0;
+    if (src_w > 0 && src_h > 0 && (src_w != (uint32_t)target_w || src_h != (uint32_t)target_h)) {
+        double sx = (double)target_w / (double)src_w;
+        double sy = (double)target_h / (double)src_h;
+        scale = (sx > sy) ? sx : sy;
+        ox = ((double)target_w - (double)src_w * scale) * 0.5;
+        oy = ((double)target_h - (double)src_h * scale) * 0.5;
+    }
 
     Inst *insts = (Inst *)malloc((size_t)n * sizeof(Inst));
     for (uint32_t i = 0; i < n; i++) {
         int32_t b[6];
         if (fread(b, 4, 6, f) != 6) { free(insts); fclose(f); return -1; }
-        insts[i].x = b[0]; insts[i].y = b[1]; insts[i].w = b[2];
-        insts[i].h = b[3]; insts[i].op_id = b[4]; insts[i].page_idx = b[5];
+        if (scale != 1.0) {
+            insts[i].x = (int32_t)((double)b[0] * scale + ox);
+            insts[i].y = (int32_t)((double)b[1] * scale + oy);
+            insts[i].w = (int32_t)((double)b[2] * scale + 0.5);
+            insts[i].h = (int32_t)((double)b[3] * scale + 0.5);
+        } else {
+            insts[i].x = b[0]; insts[i].y = b[1];
+            insts[i].w = b[2]; insts[i].h = b[3];
+        }
+        insts[i].op_id = b[4]; insts[i].page_idx = b[5];
     }
     fclose(f);
     *out = insts; *nout = (int)n;
@@ -524,7 +545,7 @@ int main(int argc, char **argv) {
     int loaded_count = 0;
     for (int i = 0; i < n_manifests; i++) {
         Inst *insts = NULL; int n = 0;
-        if (load_manifest(manifest_paths[i], &insts, &n) != 0) {
+        if (load_manifest(manifest_paths[i], &insts, &n, width, height) != 0) {
             cli_warn("skip bad manifest: %s", manifest_paths[i]);
             loaded[i].insts = NULL;
             loaded[i].n = 0;

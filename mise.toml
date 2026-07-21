@@ -107,8 +107,8 @@ description = "Run full pipeline: arrange then render"
 depends = ["arrange", "render"]
 
 [tasks.test]
-description = "Clean, build, and run a quick test (50 frames)"
-depends = ["gen-lib", "build-arrange", "build-render"]
+description = "Clean, build, and run a full test (5000 frames, 2000 source pages)"
+depends = ["build-arrange", "build-render"]
 run = '''
 set -e
 VIDEO="${1:-../badapple.mp4}"
@@ -118,22 +118,25 @@ shift 2 2>/dev/null || true
 echo "--- test: clean ---"
 rm -rf manifests_greedy/ *.mov *.mp4
 
+echo "--- test: generate library (2000 pages) ---"
+python3 gen_test_lib.py --pages 2000 --seed 42 --output "$LIB"
+
 echo "--- test: build arrange ---"
 mise run build-arrange
 
-echo "--- test: arrange (50 frames) ---"
+echo "--- test: arrange (5000 frames) ---"
 MISE_FEATURES="$LIB/features.bin" MISE_REGISTRY="$LIB/registry.bin" \
     ./arrange --video "$VIDEO" --features "$LIB/features.bin" \
-    --registry "$LIB/registry.bin" --manifests manifests_greedy --max-frames 50 "$@"
+    --registry "$LIB/registry.bin" --manifests manifests_greedy --max-frames 5000 "$@"
 
 echo "--- test: build render ---"
 mise run build-render
 
-echo "--- test: render (50 frames) ---"
+echo "--- test: render (5000 frames) ---"
 MISE_REGISTRY="$LIB/registry.bin" \
     ./render --manifests manifests_greedy --registry "$LIB/registry.bin" \
     --output test_output --width 7680 --height 4320 --fps 60 \
-    --max-frames 50 "$@"
+    --max-frames 5000 "$@"
 
 echo "--- test: output ---"
 ls -lh test_output.*
@@ -142,7 +145,7 @@ echo "--- test: PASSED ---"
 
 [tasks.gen-lib]
 description = "Generate a test library with meaningful visual patterns, registry, and images"
-run = "python3 gen_test_lib.py ${@:---pages 200 --seed 42 --output test_lib}"
+run = "python3 gen_test_lib.py ${@:---pages 2000 --seed 42 --output test_lib}"
 
 [tasks.benchmark-arrange]
 description = "Benchmark stage 1 (arrangement) with timing"
