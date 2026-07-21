@@ -50,8 +50,11 @@ static int cache_lookup(const uint8_t *feat, int *pid) {
 static void cache_put(const uint8_t *feat, int pid) {
     if (g_cache_n + 1 > g_cache_cap) {
         size_t ncap = g_cache_cap ? g_cache_cap * 2 : 1024;
-        g_cache = realloc(g_cache, ncap * sizeof(CacheEntry));
-        g_cache_hash = realloc(g_cache_hash, ncap * sizeof(unsigned));
+        CacheEntry *new_cache = realloc(g_cache, ncap * sizeof(CacheEntry));
+        unsigned *new_hash = realloc(g_cache_hash, ncap * sizeof(unsigned));
+        if (!new_cache || !new_hash) { free(new_cache); free(new_hash); return; }
+        g_cache = new_cache;
+        g_cache_hash = new_hash;
         memset(g_cache_hash, 0, ncap * sizeof(unsigned));
         g_cache_cap = ncap;
     }
@@ -220,6 +223,7 @@ int main(int argc, char **argv) {
         }
     }
     video_decoder_close(vd);
+    ba_free_features(&db);
 
     double total_time = (double)(clock() - start) / CLOCKS_PER_SEC;
     double overall_fps = frames_done / (total_time > 0.0 ? total_time : 1.0);
@@ -243,10 +247,15 @@ int main(int argc, char **argv) {
     }
 
     if (g_cli.json) {
+        char jbuf[64];
         cli_json_start();
         cli_json_field("stage", "arrange");
-        cli_json_field("frames", (char[32]){0}); /* placeholder */
-        cli_json_field("fps", (char[32]){0});
+        snprintf(jbuf, sizeof(jbuf), "%d", frames_done);
+        cli_json_field("frames", jbuf);
+        snprintf(jbuf, sizeof(jbuf), "%.2f", overall_fps);
+        cli_json_field("fps", jbuf);
+        snprintf(jbuf, sizeof(jbuf), "%d", total_tiles);
+        cli_json_field("tiles", jbuf);
         cli_json_end();
     }
 
@@ -348,8 +357,10 @@ void solve_full(const Img *frame, const uint8_t *gray, int w, int h,
                     int pidx = n;
                     if (nt >= placeholder_cap) {
                         int ncap = placeholder_cap ? placeholder_cap * 2 : 256;
-                        placeholder_idx = (int *)realloc(placeholder_idx,
-                                                          (size_t)ncap * sizeof(int));
+                        int *new_idx = (int *)realloc(placeholder_idx,
+                                                       (size_t)ncap * sizeof(int));
+                        if (!new_idx) { free(feat_buf); goto done; }
+                        placeholder_idx = new_idx;
                         placeholder_cap = ncap;
                     }
                     placeholder_idx[nt] = pidx;
@@ -382,6 +393,7 @@ void solve_full(const Img *frame, const uint8_t *gray, int w, int h,
         t->tiles += nt;
     }
 
+done:
     free(placeholder_idx);
     t->solve += (double)(clock() - t0) / CLOCKS_PER_SEC;
     *nout = n;

@@ -27,7 +27,8 @@ struct VideoDecoder {
 };
 
 VideoDecoder *video_decoder_open(const char *path) {
-    avformat_network_init();
+    static int network_inited = 0;
+    if (!network_inited) { avformat_network_init(); network_inited = 1; }
     VideoDecoder *vd = (VideoDecoder *)calloc(1, sizeof(VideoDecoder));
     if (!vd) return NULL;
     if (avformat_open_input(&vd->fmt, path, NULL, NULL) != 0) { free(vd); return NULL; }
@@ -190,9 +191,6 @@ struct VideoEncoder {
     AVPacket *pkt;
     int width, height;
     enum AVPixelFormat dst_pix_fmt;
-    /* scratch buffer for 1-channel → BGR24 expansion */
-    uint8_t *bgr_scratch;
-    int     bgr_scratch_cap;
 };
 
 VideoEncoder *video_encoder_open(const char *path, int w, int h, double fps,
@@ -241,7 +239,13 @@ VideoEncoder *video_encoder_open(const char *path, int w, int h, double fps,
     ve->frame->format = ve->dst_pix_fmt;
     ve->frame->width = w; ve->frame->height = h;
     ve->frame->pts = 0;
-    av_frame_get_buffer(ve->frame, 0);
+    if (av_frame_get_buffer(ve->frame, 0) < 0) {
+        av_frame_free(&ve->frame);
+        avcodec_free_context(&ve->ctx);
+        avformat_free_context(ve->fmt);
+        free(ve);
+        return NULL;
+    }
     ve->pkt = av_packet_alloc();
     return ve;
 }
@@ -295,7 +299,6 @@ void video_encoder_close(VideoEncoder *ve) {
     sws_freeContext(ve->sws);
     av_frame_free(&ve->frame);
     av_packet_free(&ve->pkt);
-    free(ve->bgr_scratch);
     avcodec_free_context(&ve->ctx);
     avformat_free_context(ve->fmt);
     free(ve);

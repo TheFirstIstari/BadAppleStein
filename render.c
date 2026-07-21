@@ -2,7 +2,7 @@
  * render.c — pure-C render stage with CLI integration.
  *
  * Reads manifests_greedy/*.bin, looks up source images from registry,
- * assembles frames, and pipes them to ffmpeg via stdin.
+ * assembles frames, and writes them to an output file via libav.
  *
  * Usage:
  *   render --manifests dir --registry registry.bin --output out.mov \
@@ -14,6 +14,7 @@
 #include "cli.h"
 #include "pdf.h"
 
+#include <strings.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -22,6 +23,12 @@
 #define MAX_INSTS     65536
 
 typedef struct { int32_t x, y, w, h, op_id, page_idx; } Inst;
+
+static int has_suffix(const char *s, const char *suffix) {
+    size_t sl = strlen(s), fl = strlen(suffix);
+    if (sl < fl) return 0;
+    return strcasecmp(s + sl - fl, suffix) == 0;
+}
 
 static int cmp_manifest(const void *a, const void *b) {
     return strcmp(*(const char **)a, *(const char **)b);
@@ -125,14 +132,14 @@ int main(int argc, char **argv) {
     int n_manifests = 0, cap = 0;
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
-        if (!strstr(de->d_name, ".bin")) continue;
+        if (!has_suffix(de->d_name, ".bin")) continue;
         char full[2048];
         snprintf(full, sizeof(full), "%s/%s", man_dir, de->d_name);
-    if (n_manifests >= cap) {
-        cap = cap ? cap * 2 : 256;
-        manifest_paths = (char **)realloc(manifest_paths, (size_t)cap * sizeof(char *));
-    }
-    manifest_paths[n_manifests++] = strdup(full);
+        if (n_manifests >= cap) {
+            cap = cap ? cap * 2 : 256;
+            manifest_paths = (char **)realloc(manifest_paths, (size_t)cap * sizeof(char *));
+        }
+        manifest_paths[n_manifests++] = strdup(full);
     }
     closedir(d);
 
@@ -143,8 +150,7 @@ int main(int argc, char **argv) {
     qsort(manifest_paths, (size_t)n_manifests, sizeof(char *), cmp_manifest);
 
     /* Build atlas: render each unique (pdf_path, page_idx) to a grayscale image */
-    cli_info("building atlas...");
-    /* For now, render on-the-fly per frame (simplified). Full version caches atlas. */
+    /* Note: source pages are rendered on-the-fly per frame (no atlas cache yet). */
 
     /* Open ffmpeg encoder */
     VideoEncoder *ve = video_encoder_open(output, width, height, fps, pix_fmt, codec);
@@ -179,13 +185,17 @@ int main(int argc, char **argv) {
                 /* Solid color */
                 if (insts[i].op_id == -1) {
                     for (int yy = insts[i].y; yy < insts[i].y + insts[i].h && yy < height; yy++) {
+                        if (yy < 0) continue;
                         for (int xx = insts[i].x; xx < insts[i].x + insts[i].w && xx < width; xx++) {
+                            if (xx < 0) continue;
                             canvas[(size_t)yy * width + xx] = 0;
                         }
                     }
                 } else if (insts[i].op_id == -2) {
                     for (int yy = insts[i].y; yy < insts[i].y + insts[i].h && yy < height; yy++) {
+                        if (yy < 0) continue;
                         for (int xx = insts[i].x; xx < insts[i].x + insts[i].w && xx < width; xx++) {
+                            if (xx < 0) continue;
                             canvas[(size_t)yy * width + xx] = 255;
                         }
                     }

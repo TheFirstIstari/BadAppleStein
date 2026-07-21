@@ -1,68 +1,80 @@
 # BadAppleStein
 
-BadAppleStein is a multimedia reconstruction project that recreates high-contrast video animations by matching video frames to a library of PDF pages. It combines C and Python components for efficient frame matching and multiple rendering pipelines to generate creative outputs from a PDF library.
+Reconstructs high-contrast video animations by matching video frames to a library of source images/PDFs. A pure-C pipeline: arrange (tile matching) → render (video assembly).
 
 [![Watch the demo on YouTube](https://img.youtube.com/vi/Ia1wR8HScm0/0.jpg)](https://www.youtube.com/watch?v=Ia1wR8HScm0)
-
-**YouTube demo:** https://www.youtube.com/watch?v=Ia1wR8HScm0
 
 ## Quick Start
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the full pipeline (arrange + render) - from project root
-mise run all
+# Build and run the full pipeline
+mise run run
 
 # Or run stages separately
-mise run arrange   # Stage 1: Match video tiles to PDF pages
+mise run arrange   # Stage 1: Match video tiles to source library
 mise run render    # Stage 2: Render final video
 
-# Or use the shell wrapper from BadAppleStein/
-cd BadAppleStein && ./run.sh arrange
-
-# Clean generated files
-mise run clean-all
+# Test with a small sample
+mise run test
 ```
 
-## Pipeline Stages
+## Pipeline
 
-| Stage | Script | Description |
+```
+input.mp4 → arrange → manifests/*.bin → render → output.mov
+              ↓            ↑
+         source lib    (pdf_path, page_idx) per tile
+```
+
+| Stage | Binary | Description |
 |-------|--------|-------------|
-| **arrange** | `job1_greedy_arrange.py` | Processes video frames, matches tiles to PDF pages via C matcher, outputs manifests |
-| **render** | `job2_greedy_render.py` | Reads manifests, renders cached PDFs, outputs final `.mov` |
+| **arrange** | `arrange` | Decodes video, extracts features, matches tiles to library entries, writes binary manifests |
+| **render** | `render` | Reads manifests, renders source pages (PDF/images via mupdf + libav), assembles output video |
 
-## Files of Interest
+## Building
+
+Requires: [ffmpeg](https://ffmpeg.org/) (libavformat, libavcodec, libavutil, libswscale), optionally [mupdf](https://mupdf.com/) for PDF support.
+
+```bash
+mise run build-arrange   # Compile the arrange engine
+mise run build-render    # Compile the render engine (needs mupdf for PDFs)
+```
+
+## Source Library
+
+The arrange stage matches against a pre-built feature library:
+
+- `features.bin` — Quantized feature vectors (N×N grid, 1-8 bits/cell, grayscale or color)
+- `registry.bin` — Maps library entries to source file paths and page indices
+
+Generate a test library:
+
+```bash
+mise run gen-lib   # Creates test_lib/ with 200 random PNG pages
+```
+
+## Key Files
 
 | File | Description |
 |------|-------------|
-| `match.c` | Hamming-distance bitmask matcher (C) |
-| `libmatch.so` / `libmatch.dylib` | Compiled shared library |
-| `job1_*.py` | Arrangement scripts (C matcher integration) |
-| `job2_*.py` | Rendering scripts (FFmpeg output) |
-| `library.pkl` | Precomputed PDF signatures |
-| `mise.toml` | Task runner configuration with perf instrumentation |
+| `arrange.c` | Video decode + greedy block solver + feature extraction + matching |
+| `render.c` | Manifest loading + source page rendering + frame assembly |
+| `match.c` | L1 feature matcher (OpenMP-parallel, pages-outer for cache locality) |
+| `video.c` | FFmpeg libav decode/encode + image loader |
+| `imgops.c` | Grayscale conversion, resize, integral image, feature extraction |
+| `pdf.c` | mupdf PDF rasterization + libav image fallback |
+| `cli.c` | CLI framework (option parsing, progress, JSON output) |
+| `build_library.c` | Build a source library from images/PDFs |
+| `gen_test_lib.py` | Generate test libraries with random features |
 
-## Architecture
+## Configuration
 
-```
-badapple.mp4 → job1 (C match) → manifests_greedy/*.bin → job2 (render) → output.mov
-                ↓                    ↑
-            libmatch.so        Self-contained: (pdf_path, page) tuples
-```
-
-## Performance Measurement
-
-Both scripts output detailed timing per stage:
-- **[PERF] Loading**: Library cache load time
-- **[PERF] Stage 1/2/3**: Breakdown of render phases
-- **[PERF] arrange complete**: Total time with FPS and tile stats
-
-For more rigorous benchmarking:
 ```bash
-mise run benchmark-arrange
-mise run benchmark-render
+# Override defaults via environment or flags
+mise run arrange -- --video myvideo.mp4 --max-frames 100 --verbose
+mise run render -- --output result.mov --width 1920 --height 1080 --fps 30
 ```
 
-Requires `hyperfine` (`cargo install hyperfine`).
+## License
+
+See repository for license details.

@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 case "${1:-arrange}" in
   arrange) echo "Stage 1: arrangement (C matcher)"; mise run arrange ;;
   render)   echo "Stage 2: render from manifests_greedy/ (no library.pkl needed)"; mise run render ;;
-  all)      echo "Running full pipeline"; mise run all ;;
+  all)      echo "Running full pipeline"; mise run run ;;
   bench)      mise run benchmark-arrange; mise run benchmark-render ;;
   clean)      mise run clean-all ;;
   *) echo "usage: $0 [arrange|render|all|bench|clean]"; exit 1 ;;

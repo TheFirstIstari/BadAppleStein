@@ -60,14 +60,11 @@ void match_batch(const uint8_t* lib, const uint8_t* targets,
 
 #ifdef _OPENMP
     /* Thread count can be set via match_set_threads() before calling. */
-    extern int g_match_threads;
     if (g_match_threads > 0) omp_set_num_threads(g_match_threads);
 #endif
 
     if (n_pages == 1) {
-        const uint8_t* page = &lib[0];
         for (int t = 0; t < num_targets; t++) {
-            const uint8_t* target = &targets[(size_t)t * feat_len];
             results[t] = 0;
         }
         return;

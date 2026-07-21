@@ -66,15 +66,14 @@ static inline int ba_load_features(const char *path, FeatureDB *db) {
     if (len < 16) { free(buf); return -1; }
     uint32_t n, N, G, ch;
     memcpy(&n, buf, 4); memcpy(&N, buf + 4, 4); memcpy(&G, buf + 8, 4); memcpy(&ch, buf + 12, 4);
-    size_t need = 16 + (size_t)n * N * N * (size_t)ch;
-    if (len < need) { free(buf); return -1; }
+    /* Validate header values to prevent integer overflow and bogus allocations. */
+    if (N == 0 || N > 256 || G == 0 || G > 8 || (ch != 1 && ch != 3)) { free(buf); return -1; }
+    size_t feat_len = (size_t)N * N * (size_t)ch;
+    size_t need = 16 + (size_t)n * feat_len;
+    if (need < 16 || need > len) { free(buf); return -1; }
     db->n_pages = (int)n; db->N = (int)N; db->G = (int)G; db->channels = (int)ch;
-    db->feat_len = (int)((size_t)N * N * (size_t)ch);
-    /* keep header+data in one buffer; data points just past the 16-byte header. */
-    db->data = buf + 16;
-    /* We must not free header separately; stash the allocation for free(). */
-    /* Store the base pointer in a field we add: reuse 'data' base via a wrapper. */
-    /* Simpler: copy data out and free buf. */
+    db->feat_len = (int)feat_len;
+    /* Copy feature data out of the read buffer so we can free the raw file bytes. */
     uint8_t *data = (uint8_t *)malloc(need - 16);
     if (!data) { free(buf); return -1; }
     memcpy(data, buf + 16, need - 16);

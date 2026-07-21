@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gen_test_lib.py — Generate a test library with random features and source images.
+"""gen_test_lib.py — Generate a test library with meaningful visual patterns.
 
 Each "page" is a PNG image file.  mupdf's fz_open_document can open PNG
 images natively, so the render (pdf.c) can use them just like PDF pages.
@@ -21,6 +21,7 @@ for each tile and renders it via mupdf.
 """
 
 import argparse
+import math
 import os
 import struct
 import sys
@@ -57,6 +58,147 @@ def compute_feature(img, n, g, color):
 
 
 # ---------------------------------------------------------------------------
+#  Pattern generators  (all return page_size×page_size uint8 grayscale)
+# ---------------------------------------------------------------------------
+
+def solid(page_size, value):
+    return np.full((page_size, page_size), value, dtype=np.uint8)
+
+
+def h_gradient(page_size):
+    ramp = np.linspace(0, 255, page_size, dtype=np.uint8)
+    return np.tile(ramp, (page_size, 1))
+
+
+def v_gradient(page_size):
+    ramp = np.linspace(0, 255, page_size, dtype=np.uint8)
+    return np.tile(ramp.reshape(-1, 1), (1, page_size))
+
+
+def checkerboard(page_size, cell):
+    rows = page_size // cell
+    cols = page_size // cell
+    pattern = np.zeros((rows, cols), dtype=np.uint8)
+    for r in range(rows):
+        for c in range(cols):
+            pattern[r, c] = 255 if (r + c) % 2 == 0 else 0
+    return np.repeat(np.repeat(pattern, cell, axis=0), cell, axis=1)[:page_size, :page_size]
+
+
+def h_stripes(page_size, freq):
+    period = max(page_size // freq, 1)
+    band = np.zeros(period, dtype=np.uint8)
+    half = period // 2
+    band[:half] = 255
+    tile = np.tile(band, (page_size, 1))
+    return tile[:, :page_size]
+
+
+def v_stripes(page_size, freq):
+    period = max(page_size // freq, 1)
+    band = np.zeros(period, dtype=np.uint8)
+    half = period // 2
+    band[:half] = 255
+    tile = np.tile(band.reshape(-1, 1), (1, page_size))
+    return tile[:page_size, :]
+
+
+def diag_stripes(page_size, freq):
+    x = np.arange(page_size)
+    y = np.arange(page_size).reshape(-1, 1)
+    period = max(page_size / freq, 1.0)
+    pattern = ((x + y) % int(period * 2)).astype(np.float32)
+    return (pattern < period).astype(np.uint8) * 255
+
+
+def radial_gradient(page_size):
+    cy, cx = page_size / 2.0, page_size / 2.0
+    y, x = np.mgrid[0:page_size, 0:page_size].astype(np.float32)
+    dist = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+    max_dist = math.sqrt(cx ** 2 + cy ** 2)
+    norm = np.clip(dist / max_dist, 0, 1)
+    return (norm * 255).astype(np.uint8)
+
+
+def center_blob(page_size, radius_frac):
+    cy, cx = page_size / 2.0, page_size / 2.0
+    y, x = np.mgrid[0:page_size, 0:page_size].astype(np.float32)
+    dist = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+    r = page_size * radius_frac
+    return (dist <= r).astype(np.uint8) * 255
+
+
+def random_binary(page_size, rng):
+    return (rng.randint(0, 2, (page_size, page_size)) * 255).astype(np.uint8)
+
+
+def quantized_noise(page_size, rng, levels=4):
+    vals = np.linspace(0, 255, levels, dtype=np.uint8)
+    idx = rng.randint(0, levels, (page_size, page_size))
+    return vals[idx]
+
+
+# ---------------------------------------------------------------------------
+#  Build the pattern list
+# ---------------------------------------------------------------------------
+
+def generate_page(page_idx, page_size, rng):
+    """Return a page_size×page_size uint8 grayscale image for the given index."""
+    n_types = 22  # total number of distinct pattern slots
+
+    kind = page_idx % n_types
+
+    if kind == 0:
+        return solid(page_size, 0)
+    elif kind == 1:
+        return solid(page_size, 64)
+    elif kind == 2:
+        return solid(page_size, 128)
+    elif kind == 3:
+        return solid(page_size, 192)
+    elif kind == 4:
+        return solid(page_size, 255)
+    elif kind == 5:
+        return h_gradient(page_size)
+    elif kind == 6:
+        return v_gradient(page_size)
+    elif kind == 7:
+        return checkerboard(page_size, 2)
+    elif kind == 8:
+        return checkerboard(page_size, 4)
+    elif kind == 9:
+        return checkerboard(page_size, 8)
+    elif kind == 10:
+        return checkerboard(page_size, 16)
+    elif kind == 11:
+        freq = 2 + (page_idx // n_types) % 16
+        return h_stripes(page_size, freq)
+    elif kind == 12:
+        freq = 2 + (page_idx // n_types) % 16
+        return v_stripes(page_size, freq)
+    elif kind == 13:
+        freq = 2 + (page_idx // n_types) % 16
+        return diag_stripes(page_size, freq)
+    elif kind == 14:
+        return radial_gradient(page_size)
+    elif kind == 15:
+        r = 0.1 + 0.4 * ((page_idx // n_types) % 10) / 10.0
+        return center_blob(page_size, r)
+    elif kind == 16:
+        return random_binary(page_size, rng)
+    elif kind == 17:
+        return quantized_noise(page_size, rng, 2)
+    elif kind == 18:
+        return quantized_noise(page_size, rng, 4)
+    elif kind == 19:
+        return quantized_noise(page_size, rng, 8)
+    elif kind == 20:
+        return h_stripes(page_size, 1)
+    else:
+        return v_stripes(page_size, 1)
+
+
+# ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
 
@@ -89,51 +231,31 @@ def main():
 
     rng = np.random.RandomState(seed)
 
-    # Generate random features + page images
     print(f"Generating {n_pages} test pages (N={N}, G={G}, seed={seed})...")
 
     features = np.zeros((n_pages, feat_len), dtype=np.uint8)
     img_paths = []
 
     for i in range(n_pages):
-        # Base pattern: random binary grid at feature resolution
-        base = rng.randint(0, 2, (N, N)).astype(np.uint8)
+        img = generate_page(i, page_img_size, rng)
 
-        # Add structured patterns so matching isn't purely random:
-        # - a vertical/horizontal stripe that varies by page index
-        # - a corner patch
-        stripe_dir = (i // 10) % 2
-        if stripe_dir == 0:
-            base[:, i % N] = 1
-        else:
-            base[i % N, :] = 1
-        base[0:8, 0:8] = (i % 2)
-
-        feature_flat = base.ravel()
-        features[i] = feature_flat
-
-        # Upscale to page_img_size for the source image
-        upscale = page_img_size // N
-        img = np.repeat(np.repeat(base * 255, upscale, axis=0), upscale, axis=1).astype(np.uint8)
-
-        # Write PNG
         img_path = os.path.join(out_dir, f"page_{i:04d}.png")
         cv2.imwrite(img_path, img)
         img_paths.append(img_path)
 
-    # Write features.bin
+        features[i] = compute_feature(img, N, G, color=False)
+
     feat_path = os.path.join(out_dir, "features.bin")
     with open(feat_path, "wb") as f:
         f.write(struct.pack("<IIII", n_pages, N, G, channels))
         f.write(features.tobytes())
     print(f"  wrote {feat_path}  ({n_pages} pages, {feat_len}-byte features)")
 
-    # Write registry.bin (relative paths so it works from CWD = BadAppleStein/)
     reg_path = os.path.join(out_dir, "registry.bin")
     with open(reg_path, "wb") as f:
         f.write(struct.pack("<I", n_pages))
         for i in range(n_pages):
-            rel = img_paths[i]  # already relative to CWD
+            rel = img_paths[i]
             b = rel.encode("utf-8")
             f.write(struct.pack("<i", 0))       # page_idx (unused for images)
             f.write(struct.pack("<I", len(b)))  # path length
@@ -150,4 +272,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

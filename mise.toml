@@ -4,38 +4,6 @@
 [tools]
 python = "3.12"
 
-[tasks.setup]
-description = "Install Python dependencies"
-run = "pip install -r requirements.txt"
-sources = ["requirements.txt"]
-outputs = { auto = true }
-
-# Legacy C matcher library (kept for benchmark-c and reference)
-[tasks.build-c]
-description = "Build the legacy C matching library (unused by default, kept for benchmark-c)"
-run = '''
-CFLAGS="-O3 -march=native -funroll-loops -shared -fPIC"
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    OMP_PREFIX="$(brew --prefix libomp 2>/dev/null)"
-    if [[ -n "$OMP_PREFIX" && -d "$OMP_PREFIX" ]]; then
-        clang $CFLAGS -Xpreprocessor -fopenmp \
-            -I"$OMP_PREFIX/include" -L"$OMP_PREFIX/lib" -lomp \
-            -o libmatch.dylib match.c && echo "Built libmatch.dylib (OpenMP)"
-    else
-        clang $CFLAGS -o libmatch.dylib match.c && echo "Built libmatch.dylib (single-threaded)"
-    fi
-else
-    gcc $CFLAGS -fopenmp -o libmatch.so match.c && echo "Built libmatch.so (OpenMP)" || \
-    gcc $CFLAGS -o libmatch.so match.c && echo "Built libmatch.so (single-threaded)"
-fi
-'''
-
-# Build the library from source PDFs/images (or convert existing library.pkl)
-[tasks.build-library]
-description = "Build library from source PDFs/images (or converts library.pkl)"
-run = "python build_library.py Epstein 2>/dev/null || python convert_library.py 2>/dev/null || python build_library.py ."
-depends = ["setup"]
-
 [tasks.build-arrange]
 description = "Compile arrangement engine (pure C, libav, OpenMP matcher)"
 run = '''
@@ -72,7 +40,6 @@ else
 fi
 echo "Built ./arrange"
 '''
-depends = ["setup"]
 
 [tasks.build-render]
 description = "Compile render engine (pure C, libav, mupdf)"
@@ -108,12 +75,6 @@ else
 fi
 echo "Built ./render"
 '''
-depends = ["setup"]
-
-[tasks.arrange-py]
-description = "Reference: original Python arrange (job1)"
-run = "python job1_greedy_arrange.py"
-depends = ["setup", "build-c"]
 
 [tasks.arrange]
 description = "Stage 1 (C): Analyze video frames and match to source library"
@@ -188,8 +149,8 @@ depends = ["build-arrange"]
 
 [tasks.benchmark-render]
 description = "Benchmark stage 2 (rendering) with timing"
-run = "hyperfine --warmup 1 'python job2_greedy_render.py' --export-json benchmark-render.json"
-depends = ["render"]
+run = "hyperfine --warmup 1 './render --manifests manifests_greedy --registry registry.bin --output /dev/null --width 7680 --height 4320 --fps 60' --export-json benchmark-render.json"
+depends = ["build-render"]
 
 [tasks.clean]
 description = "Remove generated artifacts (manifests, cache, output)"
@@ -198,62 +159,3 @@ run = "rm -rf manifests_greedy/ atlas_cache/ Bad_Apple_8K_YOUTUBE.mov temp_maste
 [tasks.clean-all]
 description = "Remove all generated artifacts including library cache"
 run = "rm -rf manifests_greedy/ atlas_cache/ library.pkl features.bin registry.bin *.mov *.json arrange"
-
-[tasks.verify]
-description = "Verify C library is built and scripts can import dependencies"
-run = '''
-python -c "import cv2, numpy, pypdfium2, tqdm; print('Python deps OK')"
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    test -f arrange && echo "arrange found" || echo "arrange missing - run build-arrange"
-else
-    test -f arrange && echo "arrange found" || echo "arrange missing - run build-arrange"
-fi
-'''
-
-[tasks.inspect-library]
-description = "Show library.pkl stats and referenced PDF paths"
-run = '''
-python -c "
-import pickle, os
-if os.path.exists('library.pkl'):
-    registry, signatures = pickle.load(open('library.pkl', 'rb'))
-    print(f'Library: {len(registry)} pages, {len(signatures)} signatures')
-    unique_dirs = set(os.path.dirname(p) if os.path.dirname(p) else '.' for p, i in registry)
-    print(f'PDF directories referenced: {unique_dirs}')
-    print(f'Sample paths: {list(registry[:3])}')
-    missing = sum(1 for p, i in registry if not os.path.exists(p))
-    print(f'Missing PDF files: {missing}/{len(registry)}')
-else:
-    print('library.pkl not found - need to run library preparation')
-"
-'''
-
-[tasks.benchmark-c]
-description = "Micro-benchmark C match_batch function (new L1 matcher)"
-run = '''
-python -c "
-import ctypes, numpy as np, os, time
-lib_path = 'libmatch.dylib' if os.path.exists('libmatch.dylib') else 'libmatch.so'
-if os.path.exists(lib_path):
-    lib = ctypes.CDLL(lib_path)
-    lib.match_batch.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64), 
-                                ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
-    n_pages, n_targets = 1000, 1000
-    lib_data = np.random.randint(0, 2**64, (n_pages, 64), dtype=np.uint64)
-    targets = np.random.randint(0, 2**64, (n_targets, 64), dtype=np.uint64)
-    results = np.zeros(n_targets, dtype=np.int32)
-    lib.match_batch(lib_data.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
-                    targets.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
-                    n_pages, n_targets,
-                    results.ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
-    start = time.perf_counter()
-    lib.match_batch(lib_data.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
-                    targets.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
-                    n_pages, n_targets,
-                    results.ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
-    elapsed = time.perf_counter() - start
-    print(f'Legacy C matcher: {n_pages}x{n_targets} pairs in {elapsed:.3f}s = {n_targets/elapsed:.1f} matches/sec')
-else:
-    print('Legacy libmatch not found')
-"
-'''

@@ -21,11 +21,16 @@
 
 #include <dirent.h>
 #include <sys/stat.h>
+#include <strings.h>
 
-static int is_pdf(const char *p) { return strstr(p, ".pdf") != NULL; }
+static int has_ext(const char *p, const char *ext) {
+    const char *dot = strrchr(p, '.');
+    return dot && strcasecmp(dot, ext) == 0;
+}
+static int is_pdf(const char *p) { return has_ext(p, ".pdf"); }
 static int is_img(const char *p) {
-    return strstr(p, ".png") || strstr(p, ".jpg") || strstr(p, ".jpeg") ||
-           strstr(p, ".bmp") || strstr(p, ".gif") || strstr(p, ".tif") || strstr(p, ".tiff");
+    return has_ext(p, ".png") || has_ext(p, ".jpg") || has_ext(p, ".jpeg") ||
+           has_ext(p, ".bmp") || has_ext(p, ".gif") || has_ext(p, ".tif") || has_ext(p, ".tiff");
 }
 
 static int load_image_av(const char *path, Img *out) {
