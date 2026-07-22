@@ -56,7 +56,7 @@ size_t system_cache_budget(size_t total_memory) {
         return total_memory / 10;                            /* 512 MB–1 GB: 10% */
     {
         size_t budget = total_memory / 4;                    /* >= 1 GB: 25% */
-        size_t cap    = 2u * 1024u * 1024u * 1024u;         /* cap at 2 GB */
+        size_t cap    = 4ULL * 1024 * 1024 * 1024;          /* cap at 4 GB */
         return budget < cap ? budget : cap;
     }
 }

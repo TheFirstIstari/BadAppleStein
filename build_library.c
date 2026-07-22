@@ -6,7 +6,7 @@
  * Optionally also a JSON manifest listing explicit sources.
  *
  * Output:
- *   features.bin : uint32 n, N, G, channels ; n*N*N*channels bytes
+ *   features.bin : uint32 n_pages, feat_len, G, n_scales, scales[], has_edges ; n_pages*feat_len bytes
  *   registry.bin : uint32 n ; per entry int32 page_idx, uint32 path_len, path
  *
  * Usage:
@@ -61,10 +61,10 @@ static void print_help(void) {
         "  sources_dir              Directory containing PDFs and/or images\n"
         "\n"
         "Options:\n"
-        "  --feat <n>               Feature grid N (default: 64)\n"
         "  --bits <n>               Bits per cell G, 1-8 (default: 1)\n"
-        "  --color                  Enable color matching (3 channels)\n"
-        "  --multi-scale            Emit 0.5x, 1.0x, 1.5x, 2.0x variants\n"
+        "  --no-edges               Disable edge detection features\n"
+        "  --scales <list>          Comma-separated scale levels (default: 32,64,128)\n"
+        "  --multi-scale            Emit 0.5x, 1.0x, 1.5x, 2.0x render variants\n"
         "  --out <file>             Output features.bin (default: features.bin)\n"
         "  --threads <n>            Thread count for feature extraction (0 = auto)\n"
         "  --verbose, -v            Verbose output\n"
@@ -91,30 +91,50 @@ int main(int argc, char **argv) {
     }
 
     const char *src = argv[1];
-    int N = cli_opt_int("feat", 64);
     int G = cli_opt_int("bits", 1);
-    int color = cli_opt_bool("color", 0);
+    int has_edges = !cli_opt_bool("no-edges", 0);
     int multiscale = cli_opt_bool("multi-scale", 0);
     const char *feat_out = cli_opt_str("out", "features.bin");
     const char *reg_out = "registry.bin";
     int threads = cli_opt_int("threads", 0);
     cli_set_threads(threads);
 
-    int channels = color ? 3 : 1;
-    int feat_len = N * N * channels;
+    /* Parse feature scale levels (grid sizes for multi-res feature extraction) */
+    int feat_scales[16] = {32, 64, 128};
+    int n_feat_scales = 3;
+    if (cli_has("scales")) {
+        const char *sstr = cli_opt_str("scales", "32,64,128");
+        n_feat_scales = 0;
+        const char *p = sstr;
+        while (*p && n_feat_scales < 16) {
+            while (*p == ' ') p++;
+            feat_scales[n_feat_scales++] = atoi(p);
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+    }
+
+    /* Render scales: separate from feature scales.
+     * --multi-scale renders each page at 0.5x, 1.0x, 1.5x, 2.0x.
+     * Default: just 1.0x. */
+    float render_scales[4] = {1.0f};
+    int n_render_scales = 1;
+    if (multiscale) {
+        float rs[4] = {0.5f, 1.0f, 1.5f, 2.0f};
+        memcpy(render_scales, rs, sizeof(rs));
+        n_render_scales = 4;
+    }
+
+    /* Compute total feature length */
+    int feat_len = 0;
+    for (int i = 0; i < n_feat_scales; i++)
+        feat_len += feat_scales[i] * feat_scales[i];
+    if (has_edges) feat_len *= 2;
 
     char **paths = NULL;
     int *page_idxs = NULL;
     int nreg = 0, cap = 0;
     FeatBuf fb = {0};
-
-    float scales[4] = {1.0f};
-    int nscales = 1;
-    if (multiscale) {
-        float s[4] = {0.5f, 1.0f, 1.5f, 2.0f};
-        memcpy(scales, s, sizeof(s));
-        nscales = 4;
-    }
 
     DIR *d = opendir(src);
     if (!d) {
@@ -145,8 +165,8 @@ int main(int argc, char **argv) {
         cli_die("no sources found in: %s", src);
     }
 
-    cli_info("sources: %d entries | N=%d G=%d ch=%d | scales=%d",
-             total_sources, N, G, channels, nscales);
+    cli_info("sources: %d entries | G=%d edges=%d feat_scales=%d render_scales=%d | feat_len=%d",
+             total_sources, G, has_edges, n_feat_scales, n_render_scales, feat_len);
 
     d = opendir(src);
     if (!d) cli_die("cannot reopen sources dir: %s", src);
@@ -159,11 +179,11 @@ int main(int argc, char **argv) {
 
         if (is_pdf(full)) {
             for (int pg = 0; ; pg++) {
-                for (int si = 0; si < nscales; si++) {
+                for (int ri = 0; ri < n_render_scales; ri++) {
                     Img sim;
-                    if (pdf_render_page(full, pg, scales[si], &sim) != 0) continue;
+                    if (pdf_render_page(full, pg, render_scales[ri], &sim) != 0) continue;
                     uint8_t *feat = (uint8_t *)malloc(feat_len);
-                    img_compute_feature(&sim, N, G, color, feat);
+                    img_compute_feature_multires(&sim, feat_scales, n_feat_scales, G, has_edges, feat);
                     img_free(&sim);
                     feat_push(&fb, feat, feat_len);
                     free(feat);
@@ -191,16 +211,16 @@ int main(int argc, char **argv) {
                 cli_warn("skip unreadable image: %s", full);
                 continue;
             }
-            for (int si = 0; si < nscales; si++) {
+            for (int ri = 0; ri < n_render_scales; ri++) {
                 Img sim;
-                if (scales[si] == 1.0f) {
+                if (render_scales[ri] == 1.0f) {
                     sim = im; sim.pixels = NULL;
                 } else {
-                    img_resize_area(&im, &sim, im.w * (int)scales[si], im.h * (int)scales[si]);
+                    img_resize_area(&im, &sim, im.w * (int)render_scales[ri], im.h * (int)render_scales[ri]);
                 }
                 uint8_t *feat = (uint8_t *)malloc(feat_len);
-                img_compute_feature(&sim, N, G, color, feat);
-                if (scales[si] != 1.0f) img_free(&sim);
+                img_compute_feature_multires(&sim, feat_scales, n_feat_scales, G, has_edges, feat);
+                if (render_scales[ri] != 1.0f) img_free(&sim);
                 feat_push(&fb, feat, feat_len);
                 free(feat);
                 if (nreg >= cap) {
@@ -226,12 +246,23 @@ int main(int argc, char **argv) {
         cli_die("no sources processed");
     }
 
-    /* Write features.bin */
+    /* Write features.bin — new multi-resolution format */
     FILE *f = fopen(feat_out, "wb");
     if (!f) cli_die("cannot write %s", feat_out);
-    uint32_t un = (uint32_t)nreg, uN = (uint32_t)N, uG = (uint32_t)G, uch = (uint32_t)channels;
-    fwrite(&un, 4, 1, f); fwrite(&uN, 4, 1, f);
-    fwrite(&uG, 4, 1, f); fwrite(&uch, 4, 1, f);
+    uint32_t un = (uint32_t)nreg;
+    uint32_t ufeat_len = (uint32_t)feat_len;
+    uint32_t uG = (uint32_t)G;
+    uint32_t un_scales = (uint32_t)n_feat_scales;
+    uint32_t uhas_edges = (uint32_t)has_edges;
+    fwrite(&un, 4, 1, f);
+    fwrite(&ufeat_len, 4, 1, f);
+    fwrite(&uG, 4, 1, f);
+    fwrite(&un_scales, 4, 1, f);
+    for (int i = 0; i < n_feat_scales; i++) {
+        uint32_t us = (uint32_t)feat_scales[i];
+        fwrite(&us, 4, 1, f);
+    }
+    fwrite(&uhas_edges, 4, 1, f);
     fwrite(fb.data, 1, (size_t)fb.len, f);
     fclose(f);
 
@@ -248,7 +279,7 @@ int main(int argc, char **argv) {
     fclose(f);
 
     cli_progress_done("library built");
-    cli_info("output: %s (%d entries, %d bytes)", feat_out, nreg, fb.len);
+    cli_info("output: %s (%d entries, %d bytes/feature)", feat_out, nreg, feat_len);
     cli_info("registry: %s (%d entries)", reg_out, nreg);
 
     /* cleanup */

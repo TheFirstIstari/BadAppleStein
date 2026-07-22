@@ -212,8 +212,8 @@ void cli_die(const char *fmt, ...) {
 /* ------------------------------------------------------------------ */
 static double g_last_progress = -1.0;
 
-void cli_progress_frame(int frame, int total_frames, double fps,
-                        double cache_hit_pct) {
+void cli_progress_frame(const char *label, int frame, int total_frames,
+                        double fps, double cache_hit_pct) {
     if (g_cli.quiet || g_cli.json) return;
 
     double pct = 0.0;
@@ -225,12 +225,12 @@ void cli_progress_frame(int frame, int total_frames, double fps,
 
     if (is_tty()) {
         fprintf(stderr, "\r\033[K");
-        fprintf(stderr, "\033[1;32m[arrange]\033[0m frame %d/%d (%.1f%%) | %.1f fps | cache %.1f%%",
-                frame, total_frames, pct, fps, cache_hit_pct);
+        fprintf(stderr, "\033[1;32m[%s]\033[0m frame %d/%d (%.1f%%) | %.1f fps | cache %.1f%%",
+                label, frame, total_frames, pct, fps, cache_hit_pct);
         fflush(stderr);
     } else {
-        fprintf(stderr, "[arrange] frame %d/%d (%.1f%%) | %.1f fps | cache %.1f%%\n",
-                frame, total_frames, pct, fps, cache_hit_pct);
+        fprintf(stderr, "[%s] frame %d/%d (%.1f%%) | %.1f fps | cache %.1f%%\n",
+                label, frame, total_frames, pct, fps, cache_hit_pct);
     }
 }
 

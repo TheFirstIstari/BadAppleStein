@@ -38,9 +38,10 @@ void cli_warn(const char *fmt, ...);
 void cli_error(const char *fmt, ...);
 void cli_die(const char *fmt, ...);   /* prints + exits */
 
-/* Progress: percent is 0-100. total_frames may be 0 if unknown. */
-void cli_progress_frame(int frame, int total_frames, double fps,
-                        double cache_hit_pct);
+/* Progress: percent is 0-100. total_frames may be 0 if unknown.
+ * label is the stage tag shown in brackets, e.g. "arrange", "render". */
+void cli_progress_frame(const char *label, int frame, int total_frames,
+                        double fps, double cache_hit_pct);
 void cli_progress_stage(const char *stage, int percent);
 void cli_progress_done(const char *summary);
 

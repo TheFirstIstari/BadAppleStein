@@ -47,7 +47,18 @@ static int has_suffix(const char *s, const char *suffix) {
 }
 
 static int cmp_manifest(const void *a, const void *b) {
-    return strcmp(*(const char **)a, *(const char **)b);
+    /* Sort by numeric frame number embedded in filename (e.g. "0042.bin").
+     * Falls back to lexicographic if no digits found. */
+    const char *sa = *(const char **)a;
+    const char *sb = *(const char **)b;
+    /* Find last '/' then parse leading digits */
+    const char *fa = strrchr(sa, '/');
+    const char *fb = strrchr(sb, '/');
+    fa = fa ? fa + 1 : sa;
+    fb = fb ? fb + 1 : sb;
+    int na = atoi(fa), nb = atoi(fb);
+    if (na != nb) return na - nb;
+    return strcmp(sa, sb);
 }
 
 static int load_manifest(const char *path, Inst **out, int *nout,
@@ -80,10 +91,21 @@ static int load_manifest(const char *path, Inst **out, int *nout,
         int32_t b[6];
         if (fread(b, 4, 6, f) != 6) { free(insts); fclose(f); return -1; }
         if (scale != 1.0) {
-            insts[i].x = (int32_t)((double)b[0] * scale + ox);
-            insts[i].y = (int32_t)((double)b[1] * scale + oy);
-            insts[i].w = (int32_t)((double)b[2] * scale + 0.5);
-            insts[i].h = (int32_t)((double)b[3] * scale + 0.5);
+            /* Compute new position and size with rounding (not truncation)
+             * to eliminate 1px gaps at tile boundaries. */
+            double nx = (double)b[0] * scale + ox;
+            double ny = (double)b[1] * scale + oy;
+            double nw = (double)b[2] * scale;
+            double nh = (double)b[3] * scale;
+            insts[i].x = (int32_t)(nx + 0.5);
+            insts[i].y = (int32_t)(ny + 0.5);
+            insts[i].w = (int32_t)(nw + 0.5);
+            insts[i].h = (int32_t)(nh + 0.5);
+            /* Clamp to canvas bounds */
+            if (insts[i].x < 0) insts[i].x = 0;
+            if (insts[i].y < 0) insts[i].y = 0;
+            if (insts[i].x + insts[i].w > target_w) insts[i].w = target_w - insts[i].x;
+            if (insts[i].y + insts[i].h > target_h) insts[i].h = target_h - insts[i].y;
         } else {
             insts[i].x = b[0]; insts[i].y = b[1];
             insts[i].w = b[2]; insts[i].h = b[3];
@@ -96,12 +118,17 @@ static int load_manifest(const char *path, Inst **out, int *nout,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Atlas cache — render each unique source page once                  */
+/*  Atlas cache — tile-level caching                                   */
+/*  Key: (op_id, tile_w, tile_h). Each entry stores the pre-scaled    */
+/*  tile image ready to blit. Tiny entries (~50 KB) vs old full-page  */
+/*  entries (~16 MB), so thousands fit in the budget.                  */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    int      op_id;        /* key: registry index (-1/-2 for solid colors) */
-    Img      gray;         /* cached grayscale image (owner) */
+    int      op_id;        /* key part 1: registry index (-1/-2 = solid) */
+    int      tile_w;       /* key part 2: output tile width */
+    int      tile_h;       /* key part 3: output tile height */
+    Img      tile;         /* cached pre-scaled tile (owner) */
     size_t   bytes;        /* memory used by this entry */
     int      valid;        /* 1 if slot is occupied */
     uint32_t lru;          /* insertion order for eviction */
@@ -133,7 +160,7 @@ static void atlas_init(AtlasCache *atlas, size_t budget) {
 
 static void atlas_free(AtlasCache *atlas) {
     for (int i = 0; i < atlas->capacity; i++) {
-        if (atlas->entries[i].valid) img_free(&atlas->entries[i].gray);
+        if (atlas->entries[i].valid) img_free(&atlas->entries[i].tile);
     }
     free(atlas->entries);
     atlas->entries = NULL;
@@ -141,32 +168,38 @@ static void atlas_free(AtlasCache *atlas) {
     atlas->total_bytes = 0;
 }
 
-static unsigned atlas_hash(int op_id) {
+static unsigned atlas_hash(int op_id, int tw, int th) {
     unsigned h = (unsigned)op_id * 2654435761u;
+    h ^= (unsigned)tw * 374761393u;
+    h ^= (unsigned)th * 668265263u;
     return h ? h : 1;
 }
 
 /* Thread-safe read-only lookup (no shared state mutation) */
-static AtlasEntry *atlas_lookup(AtlasCache *atlas, int op_id) {
+static AtlasEntry *atlas_lookup(AtlasCache *atlas, int op_id, int tw, int th) {
     if (!atlas->enabled) return NULL;
-    unsigned h = atlas_hash(op_id);
+    unsigned h = atlas_hash(op_id, tw, th);
     for (int probe = 0; probe < atlas->capacity; probe++) {
         int idx = (int)((h + (unsigned)probe) % (unsigned)atlas->capacity);
         if (!atlas->entries[idx].valid) return NULL;
-        if (atlas->entries[idx].op_id == op_id)
+        if (atlas->entries[idx].op_id == op_id &&
+            atlas->entries[idx].tile_w == tw &&
+            atlas->entries[idx].tile_h == th)
             return &atlas->entries[idx];
     }
     return NULL;
 }
 
 /* Single-threaded lookup that tracks hits/misses (for pre-population) */
-static AtlasEntry *atlas_lookup_stats(AtlasCache *atlas, int op_id) {
+static AtlasEntry *atlas_lookup_stats(AtlasCache *atlas, int op_id, int tw, int th) {
     if (!atlas->enabled) { atlas->misses++; return NULL; }
-    unsigned h = atlas_hash(op_id);
+    unsigned h = atlas_hash(op_id, tw, th);
     for (int probe = 0; probe < atlas->capacity; probe++) {
         int idx = (int)((h + (unsigned)probe) % (unsigned)atlas->capacity);
         if (!atlas->entries[idx].valid) { atlas->misses++; return NULL; }
-        if (atlas->entries[idx].op_id == op_id) {
+        if (atlas->entries[idx].op_id == op_id &&
+            atlas->entries[idx].tile_w == tw &&
+            atlas->entries[idx].tile_h == th) {
             atlas->entries[idx].lru = atlas->tick++;
             atlas->hits++;
             return &atlas->entries[idx];
@@ -187,17 +220,18 @@ static void atlas_evict_lru(AtlasCache *atlas) {
     }
     if (oldest_idx >= 0) {
         atlas->total_bytes -= atlas->entries[oldest_idx].bytes;
-        img_free(&atlas->entries[oldest_idx].gray);
+        img_free(&atlas->entries[oldest_idx].tile);
         atlas->entries[oldest_idx].valid = 0;
         atlas->count--;
     }
 }
 
-static void atlas_insert(AtlasCache *atlas, int op_id, const Img *gray) {
+static void atlas_insert(AtlasCache *atlas, int op_id, int tw, int th,
+                          const Img *tile) {
     if (!atlas->enabled) return;
 
-    /* Evict until we have room (each entry is ~w*h bytes) */
-    size_t entry_bytes = (size_t)gray->w * gray->h;
+    /* Evict until we have room */
+    size_t entry_bytes = (size_t)tile->w * tile->h;
     while (atlas->total_bytes + entry_bytes > atlas->budget && atlas->count > 0)
         atlas_evict_lru(atlas);
 
@@ -209,7 +243,9 @@ static void atlas_insert(AtlasCache *atlas, int op_id, const Img *gray) {
         /* Rehash existing entries */
         for (int i = 0; i < old_cap; i++) {
             if (atlas->entries[i].valid) {
-                unsigned h = atlas_hash(atlas->entries[i].op_id);
+                unsigned h = atlas_hash(atlas->entries[i].op_id,
+                                        atlas->entries[i].tile_w,
+                                        atlas->entries[i].tile_h);
                 for (int p = 0; p < atlas->capacity; p++) {
                     int idx = (int)((h + (unsigned)p) % (unsigned)atlas->capacity);
                     if (!new_entries[idx].valid) {
@@ -224,14 +260,16 @@ static void atlas_insert(AtlasCache *atlas, int op_id, const Img *gray) {
     }
 
     /* Insert */
-    unsigned h = atlas_hash(op_id);
+    unsigned h = atlas_hash(op_id, tw, th);
     for (int probe = 0; probe < atlas->capacity; probe++) {
         int idx = (int)((h + (unsigned)probe) % (unsigned)atlas->capacity);
         if (!atlas->entries[idx].valid) {
             atlas->entries[idx].op_id = op_id;
-            atlas->entries[idx].gray.pixels = NULL;
-            img_resize_area(gray, &atlas->entries[idx].gray, gray->w, gray->h);
-            atlas->entries[idx].bytes = (size_t)gray->w * gray->h;
+            atlas->entries[idx].tile_w = tw;
+            atlas->entries[idx].tile_h = th;
+            atlas->entries[idx].tile.pixels = NULL;
+            img_resize_area(tile, &atlas->entries[idx].tile, tw, th);
+            atlas->entries[idx].bytes = (size_t)tw * th;
             atlas->entries[idx].valid = 1;
             atlas->entries[idx].lru = atlas->tick++;
             atlas->total_bytes += atlas->entries[idx].bytes;
@@ -241,23 +279,30 @@ static void atlas_insert(AtlasCache *atlas, int op_id, const Img *gray) {
     }
 }
 
-/* Pre-render a source page into grayscale and cache it */
-static void atlas_cache_page(AtlasCache *atlas, const Registry *reg, int op_id) {
+/* Load a source page, scale to tile size, cache the result */
+static void atlas_cache_tile(AtlasCache *atlas, const Registry *reg,
+                              int op_id, int tw, int th) {
     if (op_id < 0 || op_id >= reg->n) return;
-    if (atlas_lookup_stats(atlas, op_id)) return;  /* already cached */
+    if (tw <= 0 || th <= 0) return;
+    if (atlas_lookup_stats(atlas, op_id, tw, th)) return;  /* already cached */
 
     const char *pdf_path = reg->entries[op_id].pdf_path;
     int page_idx = reg->entries[op_id].page_idx;
 
     Img src;
-    if (pdf_render_page(pdf_path, page_idx, 3.0f, &src) != 0) return;
+    if (pdf_render_page(pdf_path, page_idx, 1.0f, &src) != 0) return;
 
     Img gray;
     img_to_gray(&src, &gray);
     img_free(&src);
 
-    atlas_insert(atlas, op_id, &gray);
+    /* Scale directly to tile output size */
+    Img scaled;
+    img_resize_area(&gray, &scaled, tw, th);
     img_free(&gray);
+
+    atlas_insert(atlas, op_id, tw, th, &scaled);
+    img_free(&scaled);
 }
 
 /* ------------------------------------------------------------------ */
@@ -632,11 +677,12 @@ int main(int argc, char **argv) {
         /* Clear canvas */
         memset(canvas, 0, canvas_bytes);
 
-        /* ── Pre-populate atlas cache for this frame's source pages ── */
+        /* ── Pre-populate atlas cache for this frame's tiles ── */
         if (atlas.enabled) {
             for (int i = 0; i < n; i++) {
-                if (insts[i].op_id >= 0)
-                    atlas_cache_page(&atlas, &reg, insts[i].op_id);
+                if (insts[i].op_id >= 0 && insts[i].w > 0 && insts[i].h > 0)
+                    atlas_cache_tile(&atlas, &reg, insts[i].op_id,
+                                     insts[i].w, insts[i].h);
             }
         }
 
@@ -663,33 +709,35 @@ int main(int argc, char **argv) {
 
             if (insts[i].op_id >= reg.n) continue;
 
-            /* Check atlas cache first */
-            AtlasEntry *cached = atlas_lookup(&atlas, insts[i].op_id);
+            int dw = insts[i].w, dh = insts[i].h;
+            if (dw <= 0 || dh <= 0) continue;
 
-            Img *gray;
-            Img gray_local;
+            /* Check tile-level atlas cache first */
+            AtlasEntry *cached = atlas_lookup(&atlas, insts[i].op_id, dw, dh);
+
+            Img tile_img;
             int need_free = 0;
 
             if (cached) {
-                gray = &cached->gray;
+                /* Cache hit — tile already scaled to (dw × dh) */
+                tile_img = cached->tile;
             } else {
-                /* Render source page on-the-fly (cache disabled or budget exceeded) */
+                /* Cache miss — render source page and scale on-the-fly */
                 const char *pdf_path = reg.entries[insts[i].op_id].pdf_path;
                 int page_idx = reg.entries[insts[i].op_id].page_idx;
 
                 Img src;
-                if (pdf_render_page(pdf_path, page_idx, 3.0f, &src) != 0) continue;
-                img_to_gray(&src, &gray_local);
+                if (pdf_render_page(pdf_path, page_idx, 1.0f, &src) != 0) continue;
+                img_to_gray(&src, &tile_img);
                 img_free(&src);
-                gray = &gray_local;
+
+                /* Scale directly to output tile size */
+                Img scaled;
+                img_resize_area(&tile_img, &scaled, dw, dh);
+                img_free(&tile_img);
+                tile_img = scaled;
                 need_free = 1;
             }
-
-            /* Scale to fit block */
-            int dw = insts[i].w, dh = insts[i].h;
-            Img scaled;
-            img_resize_area(gray, &scaled, dw, dh);
-            if (need_free) img_free(&gray_local);
 
             /* Blit to canvas — row-wise memcpy (disjoint region, no lock needed) */
             int sy0 = insts[i].y, sx0 = insts[i].x;
@@ -702,11 +750,11 @@ int main(int argc, char **argv) {
                 if (copy_x + copy_w > width) copy_w = width - copy_x;
                 if (copy_w > 0) {
                     memcpy(&canvas[(size_t)dst_y * width + copy_x],
-                           &scaled.pixels[(size_t)yy * scaled.stride + copy_src_x],
+                           &tile_img.pixels[(size_t)yy * tile_img.stride + copy_src_x],
                            (size_t)copy_w);
                 }
             }
-            img_free(&scaled);
+            if (need_free) img_free(&tile_img);
         }
 
         /* ── Push assembled frame to encoder pipeline ──────────────── */
@@ -717,7 +765,10 @@ int main(int argc, char **argv) {
             clock_gettime(CLOCK_MONOTONIC, &ts_now);
             double el = (ts_now.tv_sec - ts_start.tv_sec) + (ts_now.tv_nsec - ts_start.tv_nsec) / 1e9;
             double fps_out = frames_done / (el > 0 ? el : 1);
-            cli_progress_frame(frames_done, n_manifests, fps_out, 0);
+            double cache_pct = (atlas.hits + atlas.misses > 0)
+                ? (double)atlas.hits / (double)(atlas.hits + atlas.misses) * 100.0
+                : 0.0;
+            cli_progress_frame("render", frames_done, n_manifests, fps_out, cache_pct);
         }
     }
 

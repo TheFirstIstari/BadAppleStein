@@ -9,6 +9,7 @@
  */
 #include "pdf.h"
 #include "video.h"
+#include "imgops.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,11 +30,22 @@ static int is_pdf(const char *path) {
 #include <mupdf/fitz.h>
 
 int pdf_render_page(const char *path, int page_idx, float scale, Img *out) {
-    /* Not a PDF? Load as image via libav (page_idx and scale ignored). */
+    /* Not a PDF? Load as image via libav, then upscale by scale factor. */
     if (!is_pdf(path)) {
         (void)page_idx;
-        (void)scale;
-        return video_image_load(path, out);
+        int rc = video_image_load(path, out);
+        if (rc != 0) return rc;
+        if (scale > 1.0f && out->w > 0 && out->h > 0) {
+            int nw = (int)(out->w * scale + 0.5f);
+            int nh = (int)(out->h * scale + 0.5f);
+            if (nw > 0 && nh > 0) {
+                Img upscaled;
+                img_resize_area(out, &upscaled, nw, nh);
+                img_free(out);
+                *out = upscaled;
+            }
+        }
+        return 0;
     }
 
     /* Quick file existence check before touching mupdf */
@@ -88,8 +100,19 @@ int pdf_render_page(const char *path, int page_idx, float scale, Img *out) {
     /* Without mupdf we can still load images via libav */
     if (!is_pdf(path)) {
         (void)page_idx;
-        (void)scale;
-        return video_image_load(path, out);
+        int rc = video_image_load(path, out);
+        if (rc != 0) return rc;
+        if (scale > 1.0f && out->w > 0 && out->h > 0) {
+            int nw = (int)(out->w * scale + 0.5f);
+            int nh = (int)(out->h * scale + 0.5f);
+            if (nw > 0 && nh > 0) {
+                Img upscaled;
+                img_resize_area(out, &upscaled, nw, nh);
+                img_free(out);
+                *out = upscaled;
+            }
+        }
+        return 0;
     }
     (void)page_idx;
     (void)scale;

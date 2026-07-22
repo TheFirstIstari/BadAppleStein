@@ -35,10 +35,12 @@ library.pkl
 manifests_greedy/
 atlas_cache/
 test_lib/
+test_manifests/
 
 # Test output
 test_output.mov
 test_output.mp4
+test_output_8k.mov
 
 # Logs
 *.log

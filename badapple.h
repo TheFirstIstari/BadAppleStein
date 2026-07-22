@@ -6,18 +6,23 @@
  *
  * Feature format (features.bin):
  *   uint32 n_pages
- *   uint32 N        (grid is N x N cells)
- *   uint32 G        (bits per cell, 1..8)
- *   uint32 channels (1 = grayscale, 3 = BGR color)
- *   then n_pages * (N*N*channels) bytes, row-major, one uint8 per cell value.
+ *   uint32 feat_len        (total bytes per feature)
+ *   uint32 G               (bits per cell, 1..8)
+ *   uint32 n_scales        (number of scale levels)
+ *   uint32 scale_0 ...     (grid size per level, e.g., 32, 64, 128)
+ *   uint32 has_edges       (1 = include Sobel edge features per scale)
+ *   then n_pages * feat_len bytes, one feature per page.
+ *   Each feature: [gray_s0][edge_s0?][gray_s1][edge_s1?]...
  *
  * Registry format (registry.bin):
  *   uint32 n
  *   then per entry: int32 page_idx ; uint32 path_len ; path_len bytes (UTF-8).
  *
  * Manifest format (<dir>/<frame04d>.bin):
+ *   uint32 src_w, src_h  (source video frame dimensions, for coordinate scaling)
  *   uint32 n
  *   then n records of 24 bytes: int32 x, y, w, h, op_id, page_idx.
+ *   Coordinates are in source-video pixel space; render scales them to output.
  */
 #ifndef BADAPPLE_H
 #define BADAPPLE_H
@@ -53,30 +58,56 @@ static inline int ba_read_file(const char *path, uint8_t **out, size_t *out_len)
 /* Load features.bin header + data. Caller frees *features with free(). */
 typedef struct {
     int n_pages;
-    int N;
-    int G;
-    int channels;
-    int feat_len;          /* N*N*channels */
+    int feat_len;          /* total bytes per feature (sum of all scale levels) */
+    int G;                 /* bits per cell (1..8) */
+    int n_scales;          /* number of scale levels */
+    int *scales;           /* array of grid sizes (e.g., {32, 64, 128}) */
+    int has_edges;         /* 1 if edge features included per scale */
     uint8_t *data;         /* n_pages * feat_len bytes */
 } FeatureDB;
 
 static inline int ba_load_features(const char *path, FeatureDB *db) {
     uint8_t *buf; size_t len;
     if (ba_read_file(path, &buf, &len) != 0) return -1;
-    if (len < 16) { free(buf); return -1; }
-    uint32_t n, N, G, ch;
-    memcpy(&n, buf, 4); memcpy(&N, buf + 4, 4); memcpy(&G, buf + 8, 4); memcpy(&ch, buf + 12, 4);
-    /* Validate header values to prevent integer overflow and bogus allocations. */
-    if (N == 0 || N > 256 || G == 0 || G > 8 || (ch != 1 && ch != 3)) { free(buf); return -1; }
-    size_t feat_len = (size_t)N * N * (size_t)ch;
-    size_t need = 16 + (size_t)n * feat_len;
-    if (need < 16 || need > len) { free(buf); return -1; }
-    db->n_pages = (int)n; db->N = (int)N; db->G = (int)G; db->channels = (int)ch;
+    /* Minimum header: n_pages + feat_len + G + n_scales + 1 scale + has_edges = 6 uint32s = 24 bytes */
+    if (len < 24) { free(buf); return -1; }
+    uint32_t n, feat_len, G, n_scales, has_edges;
+    memcpy(&n, buf, 4);
+    memcpy(&feat_len, buf + 4, 4);
+    memcpy(&G, buf + 8, 4);
+    memcpy(&n_scales, buf + 12, 4);
+    /* Validate basic header values */
+    if (G == 0 || G > 8 || n_scales == 0 || n_scales > 16) { free(buf); return -1; }
+    size_t header_len = 16 + (size_t)n_scales * 4 + 4;  /* 4 uint32s + n_scales scales + has_edges */
+    if (len < header_len) { free(buf); return -1; }
+    /* Read scale array */
+    int *scales = (int *)malloc((size_t)n_scales * sizeof(int));
+    if (!scales) { free(buf); return -1; }
+    for (uint32_t i = 0; i < n_scales; i++) {
+        uint32_t s; memcpy(&s, buf + 16 + i * 4, 4);
+        if (s == 0 || s > 256) { free(scales); free(buf); return -1; }
+        scales[i] = (int)s;
+    }
+    memcpy(&has_edges, buf + 16 + n_scales * 4, 4);
+    /* Validate feat_len matches expectations */
+    size_t expected_feat_len = 0;
+    for (uint32_t i = 0; i < n_scales; i++) {
+        expected_feat_len += (size_t)scales[i] * scales[i];
+    }
+    expected_feat_len *= (has_edges ? 2 : 1);
+    if (feat_len != (uint32_t)expected_feat_len) { free(scales); free(buf); return -1; }
+    size_t need = header_len + (size_t)n * feat_len;
+    if (need < header_len || need > len) { free(scales); free(buf); return -1; }
+    db->n_pages = (int)n;
     db->feat_len = (int)feat_len;
-    /* Copy feature data out of the read buffer so we can free the raw file bytes. */
-    uint8_t *data = (uint8_t *)malloc(need - 16);
-    if (!data) { free(buf); return -1; }
-    memcpy(data, buf + 16, need - 16);
+    db->G = (int)G;
+    db->n_scales = (int)n_scales;
+    db->scales = scales;
+    db->has_edges = (int)has_edges;
+    /* Copy feature data out of the read buffer */
+    uint8_t *data = (uint8_t *)malloc(need - header_len);
+    if (!data) { free(scales); free(buf); return -1; }
+    memcpy(data, buf + header_len, need - header_len);
     free(buf);
     db->data = data;
     return 0;
@@ -84,6 +115,7 @@ static inline int ba_load_features(const char *path, FeatureDB *db) {
 
 static inline void ba_free_features(FeatureDB *db) {
     free(db->data); db->data = NULL;
+    free(db->scales); db->scales = NULL;
 }
 
 typedef struct {
@@ -141,6 +173,14 @@ static inline void img_free(Img *im) { free(im->pixels); im->pixels = NULL; im->
 /* Match function implemented in match.c (L1 over feature bytes). */
 void match_batch(const uint8_t *lib, const uint8_t *targets,
                  int n_pages, int num_targets, int feat_len, int *results);
+
+/* Coarse-to-fine matching: first match on the first coarse_len bytes (smallest
+ * scale gray feature) to select top-K candidates, then full L1 on those K.
+ * Reduces memory traffic from n_pages×feat_len to n_pages×coarse_len + K×feat_len.
+ * coarse_len <= feat_len; if coarse_len >= feat_len, falls back to direct matching. */
+void match_batch_coarse(const uint8_t *lib, const uint8_t *targets,
+                        int n_pages, int num_targets, int feat_len,
+                        int coarse_len, int *results);
 
 /* Set thread count for match_batch (OpenMP). 0 = auto. */
 void match_set_threads(int n);

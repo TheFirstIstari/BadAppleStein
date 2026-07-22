@@ -92,12 +92,12 @@ void img_threshold_u8(uint8_t *buf, int n, int thr, int maxval) {
     for (int i = 0; i < n; i++) buf[i] = (buf[i] > thr) ? (uint8_t)maxval : 0;
 }
 
-int32_t *img_integral(const uint8_t *gray, int w, int h) {
-    int32_t *I = (int32_t *)malloc((size_t)(w + 1) * (h + 1) * sizeof(int32_t));
+int64_t *img_integral(const uint8_t *gray, int w, int h) {
+    int64_t *I = (int64_t *)malloc((size_t)(w + 1) * (h + 1) * sizeof(int64_t));
     int stride = w + 1;
     for (int x = 0; x <= w; x++) I[x] = 0;
     for (int y = 0; y < h; y++) {
-        int32_t rowsum = 0;
+        int64_t rowsum = 0;
         for (int x = 0; x < w; x++) {
             rowsum += gray[(size_t)y * w + x];
             I[(size_t)(y + 1) * stride + (x + 1)] = I[(size_t)y * stride + (x + 1)] + rowsum;
@@ -107,21 +107,140 @@ int32_t *img_integral(const uint8_t *gray, int w, int h) {
     return I;
 }
 
+void img_sobel_magnitude(const uint8_t *gray, int w, int h, uint8_t *out) {
+    /* Sobel edge detection: compute gradient magnitude at each pixel.
+     * Uses the standard 3×3 Sobel kernels:
+     *   Gx = [-1 0 1; -2 0 2; -1 0 1]
+     *   Gy = [-1 -2 -1; 0 0 0; 1 2 1]
+     * Fast approximate magnitude: max(|gx|,|gy|) + min(|gx|,|gy|)/2
+     * This is within 12% of true L2 and avoids the sqrt entirely.
+     * Border pixels are copied from the nearest interior pixel. */
+    for (int y = 1; y < h - 1; y++) {
+        for (int x = 1; x < w - 1; x++) {
+            int tl = gray[(size_t)(y-1) * w + (x-1)];
+            int tc = gray[(size_t)(y-1) * w + x];
+            int tr = gray[(size_t)(y-1) * w + (x+1)];
+            int ml = gray[(size_t)y * w + (x-1)];
+            int mr = gray[(size_t)y * w + (x+1)];
+            int bl = gray[(size_t)(y+1) * w + (x-1)];
+            int bc = gray[(size_t)(y+1) * w + x];
+            int br = gray[(size_t)(y+1) * w + (x+1)];
+            int gx = -tl + tr - 2*ml + 2*mr - bl + br;
+            int gy = -tl - 2*tc - tr + bl + 2*bc + br;
+            int ax = gx < 0 ? -gx : gx;
+            int ay = gy < 0 ? -gy : gy;
+            int mag = (ax >= ay) ? ax + ay / 2 : ay + ax / 2;
+            if (mag > 255) mag = 255;
+            out[(size_t)y * w + x] = (uint8_t)mag;
+        }
+    }
+    /* Fill border pixels. */
+    for (int x = 0; x < w; x++) {
+        out[x] = out[w + x];
+        out[(size_t)(h-1) * w + x] = out[(size_t)(h-2) * w + x];
+    }
+    for (int y = 0; y < h; y++) {
+        out[(size_t)y * w] = out[(size_t)y * w + 1];
+        out[(size_t)y * w + (w-1)] = out[(size_t)y * w + (w-2)];
+    }
+}
+
 void img_compute_feature(const Img *crop, int N, int G, int color, uint8_t *out) {
     int ch = color ? 3 : 1;
+    Img work;
+
+    if (!color && crop->channels == 3) {
+        /* Grayscale mode with BGR input: convert first so we average all
+         * channels properly instead of accidentally reading just blue. */
+        img_to_gray(crop, &work);
+    } else if (color && crop->channels == 1) {
+        /* Color mode with gray input: replicate to 3 channels. */
+        work.w = crop->w; work.h = crop->h; work.channels = 3;
+        work.stride = crop->w * 3;
+        work.pixels = (uint8_t *)malloc((size_t)crop->w * crop->h * 3);
+        for (int i = 0; i < crop->w * crop->h; i++) {
+            work.pixels[i * 3 + 0] = crop->pixels[i];
+            work.pixels[i * 3 + 1] = crop->pixels[i];
+            work.pixels[i * 3 + 2] = crop->pixels[i];
+        }
+    } else {
+        /* Channel count matches mode: use as-is. */
+        work.w = crop->w; work.h = crop->h; work.channels = crop->channels;
+        work.stride = crop->stride;
+        work.pixels = (uint8_t *)malloc((size_t)crop->stride * crop->h);
+        memcpy(work.pixels, crop->pixels, (size_t)crop->stride * crop->h);
+    }
+
     Img rs;
-    img_resize_area(crop, &rs, N, N);
+    img_resize_area(&work, &rs, N, N);
+    img_free(&work);
+
     int maxv = (1 << G) - 1;
     int idx = 0;
     for (int c = 0; c < ch; c++) {
         for (int y = 0; y < N; y++) {
             for (int x = 0; x < N; x++) {
                 int v = rs.pixels[(size_t)y * rs.stride + (size_t)x * ch + c];
-                int q = (G >= 8) ? v : (v * maxv / 255);
+                int q = (G >= 8) ? v : (v * maxv + 127) / 255;
                 if (q > maxv) q = maxv;
                 out[idx++] = (uint8_t)q;
             }
         }
     }
     img_free(&rs);
+}
+
+void img_compute_feature_multires(const Img *crop, const int *scales, int n_scales,
+                                   int G, int has_edges, uint8_t *out) {
+    int idx = 0;
+
+    /* Convert to grayscale once, outside the scale loop. */
+    Img gray;
+    if (crop->channels == 3) {
+        img_to_gray(crop, &gray);
+    } else {
+        gray.w = crop->w; gray.h = crop->h; gray.channels = 1;
+        gray.stride = crop->w;
+        gray.pixels = crop->pixels;  /* shallow copy */
+    }
+
+    for (int s = 0; s < n_scales; s++) {
+        int N = scales[s];
+
+        /* Area-resample grayscale to N×N. */
+        Img rs;
+        img_resize_area(&gray, &rs, N, N);
+
+        int maxv = (1 << G) - 1;
+
+        /* Grayscale feature: quantize each cell. */
+        for (int y = 0; y < N; y++) {
+            for (int x = 0; x < N; x++) {
+                int v = rs.pixels[(size_t)y * rs.stride + x];
+                int q = (G >= 8) ? v : (v * maxv + 127) / 255;
+                if (q > maxv) q = maxv;
+                out[idx++] = (uint8_t)q;
+            }
+        }
+
+        /* Edge feature: Sobel magnitude, quantize. */
+        if (has_edges) {
+            uint8_t *edge_buf = (uint8_t *)malloc((size_t)N * N);
+            img_sobel_magnitude(rs.pixels, N, N, edge_buf);
+            for (int y = 0; y < N; y++) {
+                for (int x = 0; x < N; x++) {
+                    int v = edge_buf[(size_t)y * N + x];
+                    int q = (G >= 8) ? v : (v * maxv + 127) / 255;
+                    if (q > maxv) q = maxv;
+                    out[idx++] = (uint8_t)q;
+                }
+            }
+            free(edge_buf);
+        }
+
+        img_free(&rs);
+    }
+
+    /* Free gray only if we allocated it. */
+    if (crop->channels == 3) img_free(&gray);
 }
