@@ -100,7 +100,10 @@ static void parent_dir(const char *path, char *buf, size_t bufsz) {
 static void rmdir_recursive(const char *dir) {
     char cmd[2048];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", dir);
-    (void)system(cmd);
+    int rc = system(cmd);
+    if (rc != 0) {
+        fprintf(stderr, "warning: rmdir_recursive failed for %s (ignored)\n", dir);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -243,7 +246,7 @@ static int run_encode(const char *input, const char *output,
     char output_dir[1024];
     parent_dir(output, output_dir, sizeof(output_dir));
 
-    char manifests_tpl[1024];
+    char manifests_tpl[2048];
     snprintf(manifests_tpl, sizeof(manifests_tpl),
              "%s/.badapplestein-manifests-XXXXXX", output_dir);
     char *manifests_dir = mkdtemp(manifests_tpl);

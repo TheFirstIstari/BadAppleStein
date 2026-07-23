@@ -262,16 +262,35 @@ void cli_progress_done(const char *summary) {
 /* ------------------------------------------------------------------ */
 /*  JSON output helpers (minimal)                                      */
 /* ------------------------------------------------------------------ */
+static void json_escape(const char *in, char *out, size_t outsz) {
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j + 2 < outsz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '\\' || c == '"') {
+            if (j + 2 >= outsz) break;
+            out[j++] = '\\';
+            out[j++] = c;
+        } else if (c < 0x20) {
+            if (j + 6 >= outsz) break;
+            j += (size_t)snprintf(out + j, outsz - j, "\\u%04x", c);
+        } else {
+            out[j++] = (char)c;
+        }
+    }
+    out[j] = '\0';
+}
+
 void cli_json_start(void) {
     if (g_cli.json) fprintf(stderr, "{\n");
 }
 
 void cli_json_field(const char *name, const char *value) {
     if (g_cli.json) {
-        /* NOTE: neither name nor value are JSON-escaped here; embedded "
-         * characters will produce invalid JSON. A future fix should escape
-         * backslash, double-quote, and control characters. */
-        fprintf(stderr, "  \"%s\": \"%s\",\n", name, value);
+        char ename[256];
+        char evalue[1024];
+        json_escape(name, ename, sizeof(ename));
+        json_escape(value, evalue, sizeof(evalue));
+        fprintf(stderr, "  \"%s\": \"%s\",\n", ename, evalue);
     }
 }
 

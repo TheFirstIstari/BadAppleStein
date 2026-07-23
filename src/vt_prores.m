@@ -244,6 +244,8 @@ void vt_prores_close(VTEncoder *enc) {
 
 #else /* !__APPLE__ — stubs */
 
+#include <stddef.h>
+
 int vt_prores_available(void) { return 0; }
 VTEncoder *vt_prores_open(const char *path, int w, int h, double fps,
                            int profile, int channels) {

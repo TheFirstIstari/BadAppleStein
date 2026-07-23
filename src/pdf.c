@@ -1,7 +1,7 @@
 /*
  * pdf.c — PDF rasterization via mupdf C API.
  *
- * Build notes: link with -lmingw (or -lmupdf) and -lfitz on most installs,
+ * Build notes: link with -lmupdf -lmupdf-third on most installs,
  * or use the mupdf single static lib. On Homebrew: `brew install mupdf`.
  *
  * When mupdf is not installed, link pdf.c without -DHAVE_MUPDF to get a

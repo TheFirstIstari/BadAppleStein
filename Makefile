@@ -86,18 +86,9 @@ else
   MUPDF_DEFINE :=
 endif
 
-# ──────────────────────────────────────────────────────────────
-# macOS render-only extras (VideoToolbox / ProRes / ObjC)
-# ──────────────────────────────────────────────────────────────
-
-ifeq ($(UNAME_S),Darwin)
-  VT_SRC   := $(SRCDIR)/vt_prores.m
-  VT_FLAGS := -fobjc-arc -framework Foundation -framework AVFoundation \
-              -framework CoreMedia -framework CoreVideo
-else
-  VT_SRC   :=
-  VT_FLAGS :=
-endif
+ALL_CFLAGS  := $(CFLAGS) $(OMP_CFLAGS) $(AV_CFLAGS) $(MUPDF_CFLAGS) \
+               -DVERSION=\"$(VERSION)\"
+ALL_LDFLAGS := $(OMP_LIBS) $(AV_LIBS) $(MUPDF_LIBS) -lm
 
 # ──────────────────────────────────────────────────────────────
 # Source lists
@@ -108,33 +99,28 @@ COMMON_SRC := $(SRCDIR)/imgops.c $(SRCDIR)/video.c $(SRCDIR)/cli.c
 ARRANGE_SRC := $(SRCDIR)/arrange.c $(SRCDIR)/match.c $(COMMON_SRC)
 
 RENDER_SRC  := $(SRCDIR)/render.c $(SRCDIR)/pdf.c $(SRCDIR)/system_detect.c \
-               $(COMMON_SRC)
+                $(COMMON_SRC)
 
 BUILD_SRC   := $(SRCDIR)/build_library.c $(SRCDIR)/pdf.c $(SRCDIR)/imgops.c \
-               $(SRCDIR)/cli.c
+                $(SRCDIR)/cli.c
 
-# Unified binary: all sources (deduplicated by the linker)
 UNIFIED_SRC := $(SRCDIR)/main.c $(SRCDIR)/arrange.c $(SRCDIR)/render.c \
                $(SRCDIR)/build_library.c $(SRCDIR)/match.c \
                $(SRCDIR)/pdf.c $(SRCDIR)/system_detect.c $(COMMON_SRC)
 
 # ──────────────────────────────────────────────────────────────
-# Aggregated flags
+# vt_prores compilation (platform-specific)
 # ──────────────────────────────────────────────────────────────
 
-ALL_CFLAGS  := $(CFLAGS) $(OMP_CFLAGS) $(AV_CFLAGS) $(MUPDF_CFLAGS) \
-               -DVERSION=\"$(VERSION)\"
-ALL_LDFLAGS := $(OMP_LIBS) $(AV_LIBS) $(MUPDF_LIBS) -lm
-RENDER_LDFLAGS := $(ALL_LDFLAGS) $(VT_FLAGS)
-
-# ──────────────────────────────────────────────────────────────
-# Man pages
-# ──────────────────────────────────────────────────────────────
-
-MAN_DIR     := $(DESTDIR)$(PREFIX)/share/man/man1
-MAN_PAGES   := man/badapplestein.1 \
-               man/badapplestein-build.1 \
-               man/badapplestein-encode.1
+ifeq ($(UNAME_S),Darwin)
+VT_SRC := $(SRCDIR)/vt_prores.m
+VT_FLAGS := -fobjc-arc -framework Foundation -framework AVFoundation -framework CoreMedia -framework CoreVideo
+VT_COMPILE_FLAGS :=
+else
+VT_SRC := $(SRCDIR)/vt_prores.m
+VT_FLAGS :=
+VT_COMPILE_FLAGS := -x c
+endif
 
 # ──────────────────────────────────────────────────────────────
 # Targets
@@ -147,8 +133,8 @@ all: badapplestein
 # Unified binary (primary target)
 badapplestein: $(SRCDIR)/badapplestein
 
-$(SRCDIR)/badapplestein: $(UNIFIED_SRC)
-	$(CC) $(ALL_CFLAGS) $^ $(RENDER_LDFLAGS) -o $@
+$(SRCDIR)/badapplestein: $(UNIFIED_SRC) $(VT_SRC)
+	$(CC) $(ALL_CFLAGS) $(MUPDF_DEFINE) $(VT_COMPILE_FLAGS) $(UNIFIED_SRC) $(VT_SRC) $(ALL_LDFLAGS) $(VT_FLAGS) -o $@
 
 # Legacy standalone binaries (still useful for development/debugging)
 arrange: $(SRCDIR)/arrange
@@ -159,10 +145,19 @@ $(SRCDIR)/arrange: $(ARRANGE_SRC)
 	$(CC) $(ALL_CFLAGS) $^ $(ALL_LDFLAGS) -o $@
 
 $(SRCDIR)/render: $(RENDER_SRC) $(VT_SRC)
-	$(CC) $(ALL_CFLAGS) $(MUPDF_DEFINE) $^ $(RENDER_LDFLAGS) -o $@
+	$(CC) $(ALL_CFLAGS) $(MUPDF_DEFINE) $(VT_COMPILE_FLAGS) $^ $(ALL_LDFLAGS) $(VT_FLAGS) -o $@
 
 $(SRCDIR)/build_library: $(BUILD_SRC)
 	$(CC) $(ALL_CFLAGS) $^ $(ALL_LDFLAGS) $(MUPDF_DEFINE) -o $@
+
+# ──────────────────────────────────────────────────────────────
+# Man pages
+# ──────────────────────────────────────────────────────────────
+
+MAN_DIR     := $(DESTDIR)$(PREFIX)/share/man/man1
+MAN_PAGES   := man/badapplestein.1 \
+               man/badapplestein-build.1 \
+               man/badapplestein-encode.1
 
 # ──────────────────────────────────────────────────────────────
 # Install / Uninstall

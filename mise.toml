@@ -12,7 +12,7 @@ run = '''
 set -e
 
 # Detect ffmpeg/libav flags — try pkg-config first, then common paths
-AVFLAGS="$(PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/opt/homebrew/Cellar/ffmpeg/8.1.2_1/lib/pkgconfig:/opt/homebrew/lib/pkgconfig" \
+AVFLAGS="$(PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig" \
     pkg-config --cflags --libs libavformat libavcodec libavutil libswscale 2>/dev/null)" || true
 if [[ -z "$AVFLAGS" ]]; then
     if [[ -d "/opt/homebrew/include/libavformat" ]]; then
@@ -47,7 +47,7 @@ echo "Built ./arrange"
 description = "Compile render engine (pure C, libav, mupdf, OpenMP)"
 run = '''
 set -e
-AVFLAGS="$(PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/opt/homebrew/Cellar/ffmpeg/8.1.2_1/lib/pkgconfig:/opt/homebrew/lib/pkgconfig" \
+AVFLAGS="$(PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig" \
     pkg-config --cflags --libs libavformat libavcodec libavutil libswscale 2>/dev/null)" || true
 if [[ -z "$AVFLAGS" ]]; then
     if [[ -d "/opt/homebrew/include/libavformat" ]]; then
@@ -94,12 +94,12 @@ echo "Built ./render"
 
 [tasks.arrange]
 description = "Stage 1 (C): Analyze video frames and match to source library"
-run = "cd BadAppleStein && ./arrange --video ../badapple.mp4 --scale 15"
+run = "./src/arrange --video badapple.mp4 --scale 15"
 depends = ["build-arrange"]
 
 [tasks.render]
 description = "Stage 2: Render final video from manifests (grayscale, needs mupdf)"
-run = "cd BadAppleStein && ./render --manifests manifests_greedy --registry registry.bin --output Bad_Apple_8K_YOUTUBE.mov --width 7680 --height 4320"
+run = "./src/render --manifests manifests_greedy --registry registry.bin --output Bad_Apple_8K_YOUTUBE.mov --width 7680 --height 4320"
 depends = ["build-render"]
 
 [tasks.run]
