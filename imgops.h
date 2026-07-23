@@ -44,18 +44,25 @@ void img_compute_feature(const Img *crop, int N, int G, int color, uint8_t *out)
  * Border pixels are filled from nearest interior. */
 void img_sobel_magnitude(const uint8_t *gray, int w, int h, uint8_t *out);
 
-/* Extract a multi-resolution feature vector with optional edge detection.
+/* Compute a multi-resolution feature vector with optional edge and color.
  *   crop       : source Img (3-channel BGR or 1-channel gray)
  *   scales     : array of grid sizes (e.g., {32, 64, 128})
  *   n_scales   : number of scale levels
  *   G          : bits per cell (1..8)
  *   has_edges  : if nonzero, include Sobel edge magnitude features
+ *   color      : if nonzero, include BGR color features
  *   out        : caller-allocated buffer of computed size
  * For each scale level, computes:
  *   - Grayscale feature: N×N cells, area-resampled and quantized
  *   - Edge feature (if has_edges): N×N Sobel magnitude cells, quantized
- * Output layout: [gray_s0][edge_s0][gray_s1][edge_s1]... */
+ *   - Color feature (if color): 3×N×N BGR cells, area-resampled and quantized
+ * Output layout:
+ *   color=0: [gray_s0][edge_s0?][gray_s1][edge_s1?]...
+ *   color=1: [gray_s0][edge_s0?][color_s0][gray_s1][edge_s1?][color_s1]...
+ * The grayscale and edge features are always computed even in color mode,
+ * because the coarse cache uses only the grayscale portion.
+ * The color portion is 3×N² bytes per scale (BGR, quantized to G bits). */
 void img_compute_feature_multires(const Img *crop, const int *scales, int n_scales,
-                                   int G, int has_edges, uint8_t *out);
+                                   int G, int has_edges, int color, uint8_t *out);
 
 #endif /* IMGOPS_H */

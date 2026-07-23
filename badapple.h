@@ -11,8 +11,11 @@
  *   uint32 n_scales        (number of scale levels)
  *   uint32 scale_0 ...     (grid size per level, e.g., 32, 64, 128)
  *   uint32 has_edges       (1 = include Sobel edge features per scale)
+ *   uint32 channels        (1 = grayscale only, 3 = color; may be absent in old files)
  *   then n_pages * feat_len bytes, one feature per page.
- *   Each feature: [gray_s0][edge_s0?][gray_s1][edge_s1?]...
+ *   Grayscale: [gray_s0][edge_s0?][gray_s1][edge_s1?]...
+ *   Color:     [gray_s0][edge_s0?][color_s0][gray_s1][edge_s1?][color_s1]...
+ *              where color_sX is 3 * N^2 bytes (BGR, quantized to G bits).
  *
  * Registry format (registry.bin):
  *   uint32 n
@@ -63,6 +66,7 @@ typedef struct {
     int n_scales;          /* number of scale levels */
     int *scales;           /* array of grid sizes (e.g., {32, 64, 128}) */
     int has_edges;         /* 1 if edge features included per scale */
+    int channels;          /* 1 = grayscale features, 3 = color features */
     uint8_t *data;         /* n_pages * feat_len bytes */
 } FeatureDB;
 
@@ -89,13 +93,27 @@ static inline int ba_load_features(const char *path, FeatureDB *db) {
         scales[i] = (int)s;
     }
     memcpy(&has_edges, buf + 16 + n_scales * 4, 4);
-    /* Validate feat_len matches expectations */
-    size_t expected_feat_len = 0;
+    /* Validate feat_len matches expectations (grayscale or color) */
+    size_t gray_feat_len = 0;
     for (uint32_t i = 0; i < n_scales; i++) {
-        expected_feat_len += (size_t)scales[i] * scales[i];
+        gray_feat_len += (size_t)scales[i] * scales[i];
     }
-    expected_feat_len *= (has_edges ? 2 : 1);
-    if (feat_len != (uint32_t)expected_feat_len) { free(scales); free(buf); return -1; }
+    size_t expected_gray = gray_feat_len * (has_edges ? 2 : 1);
+    size_t expected_color = gray_feat_len * (1 + (has_edges ? 1 : 0) + 3);
+    int detected_channels = 0;
+    if (feat_len == (uint32_t)expected_gray) {
+        detected_channels = 1;
+    } else if (feat_len == (uint32_t)expected_color) {
+        detected_channels = 3;
+        /* Try to read the channels field from header if present */
+        if (len >= header_len + 4) {
+            uint32_t ch; memcpy(&ch, buf + header_len, 4);
+            if (ch == 3) header_len += 4;
+        }
+    } else {
+        free(scales); free(buf); return -1;
+    }
+    if (len < header_len) { free(scales); free(buf); return -1; }
     size_t need = header_len + (size_t)n * feat_len;
     if (need < header_len || need > len) { free(scales); free(buf); return -1; }
     db->n_pages = (int)n;
@@ -104,6 +122,7 @@ static inline int ba_load_features(const char *path, FeatureDB *db) {
     db->n_scales = (int)n_scales;
     db->scales = scales;
     db->has_edges = (int)has_edges;
+    db->channels = detected_channels;
     /* Copy feature data out of the read buffer */
     uint8_t *data = (uint8_t *)malloc(need - header_len);
     if (!data) { free(scales); free(buf); return -1; }

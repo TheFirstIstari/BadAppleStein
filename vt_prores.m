@@ -100,6 +100,7 @@ VTEncoder *vt_prores_open(const char *path, int width, int height, double fps,
             (NSString *)kCVPixelBufferPixelFormatTypeKey: @(pb_fmt),
             (NSString *)kCVPixelBufferWidthKey: @(width),
             (NSString *)kCVPixelBufferHeightKey: @(height),
+            (NSString *)kCVPixelBufferPoolMinimumBufferCountKey: @(8),
         };
 
         AVAssetWriterInputPixelBufferAdaptor *adaptor =
@@ -111,6 +112,7 @@ VTEncoder *vt_prores_open(const char *path, int width, int height, double fps,
         [writer startSessionAtSourceTime:kCMTimeZero];
 
         VTEncoder *enc = (VTEncoder *)calloc(1, sizeof(VTEncoder));
+        if (!enc) return NULL;
         enc->writer = writer;
         enc->input = input;
         enc->adaptor = adaptor;
@@ -136,14 +138,25 @@ int vt_prores_write(VTEncoder *enc, const uint8_t *pixels, int width, int height
 
         /* Allocate pixel buffer from the adaptor's pool */
         CVPixelBufferRef pxbuf = NULL;
-        CVReturn status = CVPixelBufferPoolCreatePixelBuffer(NULL,
-            enc->adaptor.pixelBufferPool, &pxbuf);
+        CVReturn status = kCVReturnSuccess;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            status = CVPixelBufferPoolCreatePixelBuffer(NULL,
+                enc->adaptor.pixelBufferPool, &pxbuf);
+            if (status == kCVReturnSuccess && pxbuf) break;
+            NSLog(@"[vt_prores] pixel buffer alloc failed (attempt %d): %d", attempt + 1, status);
+            if (pxbuf) { CVPixelBufferRelease(pxbuf); pxbuf = NULL; }
+            [NSThread sleepForTimeInterval:0.01];
+        }
         if (status != kCVReturnSuccess || !pxbuf) {
-            NSLog(@"[vt_prores] pixel buffer alloc failed: %d", status);
+            NSLog(@"[vt_prores] pixel buffer alloc failed after retries: %d", status);
             return -1;
         }
 
-        CVPixelBufferLockBaseAddress(pxbuf, 0);
+        if (CVPixelBufferLockBaseAddress(pxbuf, 0) != kCVReturnSuccess) {
+            NSLog(@"[vt_prores] CVPixelBufferLockBaseAddress failed");
+            CVPixelBufferRelease(pxbuf);
+            return -1;
+        }
 
         if (enc->channels == 3) {
             /* ── BGRA path: BGR24 → BGRA ─────────────────────── */
@@ -185,6 +198,7 @@ int vt_prores_write(VTEncoder *enc, const uint8_t *pixels, int width, int height
             for (int y = 0; y < (int)uvPlaneH; y++) {
                 size_t fill = uvPlaneW * 2 < uvStride ? uvPlaneW * 2 : uvStride;
                 memset(uvPlane + (size_t)y * uvStride, 128, fill);
+                if (fill < uvStride) memset(uvPlane + (size_t)y * uvStride + fill, 0, uvStride - fill);
             }
         }
 

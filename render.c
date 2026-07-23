@@ -13,7 +13,7 @@
  *
  * Usage:
  *   render --manifests dir --registry registry.bin --output out.mov \
- *          --width W --height H --fps 60 [--threads N] [--verbose] [--quiet] [--json]
+ *          --width W --height H --fps 60 [--channels N] [--threads N] [--verbose] [--quiet] [--json]
  */
 #include "badapple.h"
 #include "imgops.h"
@@ -71,9 +71,9 @@ static int load_manifest(const char *path, Inst **out, int *nout,
     if (sz < 12) { fclose(f); return -1; }
 
     uint32_t src_w = 0, src_h = 0, n = 0;
-    fread(&src_w, 4, 1, f);
-    fread(&src_h, 4, 1, f);
-    fread(&n, 4, 1, f);
+    if (fread(&src_w, 4, 1, f) != 1) { fclose(f); return -1; }
+    if (fread(&src_h, 4, 1, f) != 1) { fclose(f); return -1; }
+    if (fread(&n, 4, 1, f) != 1) { fclose(f); return -1; }
     if (n > MAX_INSTS) { fclose(f); return -1; }
 
     /* Compute uniform scale with center-crop to fill output canvas */
@@ -87,6 +87,7 @@ static int load_manifest(const char *path, Inst **out, int *nout,
     }
 
     Inst *insts = (Inst *)malloc((size_t)n * sizeof(Inst));
+    if (!insts) { fclose(f); return -1; }
     for (uint32_t i = 0; i < n; i++) {
         int32_t b[6];
         if (fread(b, 4, 6, f) != 6) { free(insts); fclose(f); return -1; }
@@ -156,6 +157,10 @@ static void atlas_init(AtlasCache *atlas, size_t budget) {
     atlas->hits = 0;
     atlas->misses = 0;
     atlas->entries = (AtlasEntry *)calloc((size_t)atlas->capacity, sizeof(AtlasEntry));
+    if (!atlas->entries) {
+        atlas->enabled = 0;
+        return;
+    }
 }
 
 static void atlas_free(AtlasCache *atlas) {
@@ -231,7 +236,7 @@ static void atlas_insert(AtlasCache *atlas, int op_id, int tw, int th,
     if (!atlas->enabled) return;
 
     /* Evict until we have room */
-    size_t entry_bytes = (size_t)tile->w * tile->h;
+    size_t entry_bytes = (size_t)tile->w * tile->h * tile->channels;
     while (atlas->total_bytes + entry_bytes > atlas->budget && atlas->count > 0)
         atlas_evict_lru(atlas);
 
@@ -240,6 +245,9 @@ static void atlas_insert(AtlasCache *atlas, int op_id, int tw, int th,
         int old_cap = atlas->capacity;
         atlas->capacity *= 2;
         AtlasEntry *new_entries = (AtlasEntry *)calloc((size_t)atlas->capacity, sizeof(AtlasEntry));
+        if (!new_entries) {
+            atlas->capacity = old_cap;
+        } else {
         /* Rehash existing entries */
         for (int i = 0; i < old_cap; i++) {
             if (atlas->entries[i].valid) {
@@ -257,6 +265,7 @@ static void atlas_insert(AtlasCache *atlas, int op_id, int tw, int th,
         }
         free(atlas->entries);
         atlas->entries = new_entries;
+        }
     }
 
     /* Insert */
@@ -269,7 +278,7 @@ static void atlas_insert(AtlasCache *atlas, int op_id, int tw, int th,
             atlas->entries[idx].tile_h = th;
             atlas->entries[idx].tile.pixels = NULL;
             img_resize_area(tile, &atlas->entries[idx].tile, tw, th);
-            atlas->entries[idx].bytes = (size_t)tw * th;
+            atlas->entries[idx].bytes = (size_t)tw * th * tile->channels;
             atlas->entries[idx].valid = 1;
             atlas->entries[idx].lru = atlas->tick++;
             atlas->total_bytes += atlas->entries[idx].bytes;
@@ -281,7 +290,7 @@ static void atlas_insert(AtlasCache *atlas, int op_id, int tw, int th,
 
 /* Load a source page, scale to tile size, cache the result */
 static void atlas_cache_tile(AtlasCache *atlas, const Registry *reg,
-                              int op_id, int tw, int th) {
+                              int op_id, int tw, int th, int channels) {
     if (op_id < 0 || op_id >= reg->n) return;
     if (tw <= 0 || th <= 0) return;
     if (atlas_lookup_stats(atlas, op_id, tw, th)) return;  /* already cached */
@@ -292,17 +301,26 @@ static void atlas_cache_tile(AtlasCache *atlas, const Registry *reg,
     Img src;
     if (pdf_render_page(pdf_path, page_idx, 1.0f, &src) != 0) return;
 
-    Img gray;
-    img_to_gray(&src, &gray);
-    img_free(&src);
+    if (channels == 3) {
+        /* Cache BGR directly — skip grayscale conversion */
+        Img scaled;
+        img_resize_area(&src, &scaled, tw, th);
+        img_free(&src);
+        atlas_insert(atlas, op_id, tw, th, &scaled);
+        img_free(&scaled);
+    } else {
+        Img gray;
+        img_to_gray(&src, &gray);
+        img_free(&src);
 
-    /* Scale directly to tile output size */
-    Img scaled;
-    img_resize_area(&gray, &scaled, tw, th);
-    img_free(&gray);
+        /* Scale directly to tile output size */
+        Img scaled;
+        img_resize_area(&gray, &scaled, tw, th);
+        img_free(&gray);
 
-    atlas_insert(atlas, op_id, tw, th, &scaled);
-    img_free(&scaled);
+        atlas_insert(atlas, op_id, tw, th, &scaled);
+        img_free(&scaled);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -310,7 +328,7 @@ static void atlas_cache_tile(AtlasCache *atlas, const Registry *reg,
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    uint8_t *pixels;   /* owned copy of frame grayscale data */
+    uint8_t *pixels;   /* owned copy of frame pixel data (grayscale or BGR) */
     int      valid;    /* 1 = slot holds a frame ready for encoding */
 } FrameSlot;
 
@@ -386,6 +404,11 @@ static void pipeline_push(EncodePipeline *ep, const uint8_t *pixels, size_t nbyt
         pthread_cond_wait(&ep->can_write, &ep->mutex);
     int slot = ep->write_pos;
     ep->slots[slot].pixels = (uint8_t *)malloc(nbytes);
+    if (!ep->slots[slot].pixels) {
+        pthread_mutex_unlock(&ep->mutex);
+        fprintf(stderr, "warning: frame dropped (malloc failed)\n");
+        return;
+    }
     memcpy(ep->slots[slot].pixels, pixels, nbytes);
     ep->slots[slot].valid = 1;
     ep->write_pos = (ep->write_pos + 1) % FRAME_QUEUE_SIZE;
@@ -422,6 +445,7 @@ static void print_help(void) {
         "  --fps <n>               Output frame rate\n"
         "\n"
         "Options:\n"
+        "  --channels <n>          1=grayscale (default), 3=BGR color\n"
         "  --codec <name>          FFmpeg codec (default: auto-detect best available)\n"
         "  --pix-fmt <name>        Pixel format (default: auto from codec)\n"
         "  --no-hw                 Disable hardware encoder, force software (ProRes)\n"
@@ -437,7 +461,7 @@ static void print_help(void) {
         "\n"
         "Pipeline:\n"
         "  1. Load registry + manifests\n"
-        "  2. Render source pages (PDF/images) to grayscale atlas (cached)\n"
+        "  2. Render source pages (PDF/images) to atlas (cached)\n"
         "  3. Assemble frames (OpenMP parallel) → encode → output\n"
     );
 }
@@ -463,6 +487,8 @@ int main(int argc, char **argv) {
     int threads            = cli_opt_int("threads", 0);
     int max_frames         = cli_opt_int("max-frames", 0);
     int hw                 = !cli_has("no-hw");  /* hardware ON by default */
+    int channels           = cli_opt_int("channels", 1);
+    if (channels != 1 && channels != 3) channels = 1;
 
     if (cli_has("help") || cli_has("h") || !cli_has("manifests")) {
         print_help();
@@ -496,7 +522,7 @@ int main(int argc, char **argv) {
                     cli_info("note: output extension changed to .mov for hardware ProRes");
                     strcpy(output + olen - 3, "mov");
                 } else if (olen < 4 || output[olen - 4] != '.') {
-                    if (olen + 5 <= 4096) {
+                    if (olen + 5 <= sizeof(output_buf)) {
                         strcat(output, ".mov");
                         cli_info("note: appended .mov extension for hardware ProRes");
                     }
@@ -517,7 +543,7 @@ int main(int argc, char **argv) {
                         cli_info("note: output extension changed to .mp4 for hardware codec");
                         strcpy(output + olen - 3, "mp4");
                     } else if (olen < 4 || output[olen - 4] != '.') {
-                        if (olen + 5 <= 4096) {
+                        if (olen + 5 <= sizeof(output_buf)) {
                             strcat(output, ".mp4");
                             cli_info("note: appended .mp4 extension for hardware codec");
                         }
@@ -537,14 +563,15 @@ int main(int argc, char **argv) {
     if (!hw && output && strstr(codec, "prores")) {
         size_t olen = strlen(output);
         if (olen < 4 || output[olen - 4] != '.') {
-            if (olen + 5 <= 4096) {
+            if (olen + 5 <= sizeof(output_buf)) {
                 strcat(output, ".mov");
                 cli_info("note: appended .mov extension for ProRes");
             }
         }
     }
 
-    cli_info("render: %dx%d @ %.1f fps → %s", width, height, fps, output);
+    cli_info("render: %dx%d @ %.1f fps %s → %s", width, height, fps,
+             channels == 3 ? "(color)" : "(grayscale)", output);
     cli_info("system: %ld cores | %zu MB RAM | %d threads | cache %s (%zu MB)",
              sys.cpu_cores,
              sys.total_memory_bytes / (1024 * 1024),
@@ -605,7 +632,6 @@ int main(int argc, char **argv) {
     /* ── Open encoder ─────────────────────────────────────────── */
     VideoEncoder *ve = NULL;
     VTEncoder *vt = NULL;
-    int channels = 1;  /* current pipeline is grayscale; ready for 3 */
 
     if (use_vt_prores) {
         /* Hardware ProRes via AVFoundation (macOS Apple Silicon) */
@@ -646,7 +672,7 @@ int main(int argc, char **argv) {
     }
 
     /* ── Single canvas buffer (pipeline_push copies into queue) ── */
-    size_t canvas_bytes = (size_t)width * height;
+    size_t canvas_bytes = (size_t)width * height * channels;
     uint8_t *canvas = (uint8_t *)calloc(canvas_bytes, 1);
     if (!canvas) cli_die("cannot allocate canvas");
 
@@ -682,7 +708,7 @@ int main(int argc, char **argv) {
             for (int i = 0; i < n; i++) {
                 if (insts[i].op_id >= 0 && insts[i].w > 0 && insts[i].h > 0)
                     atlas_cache_tile(&atlas, &reg, insts[i].op_id,
-                                     insts[i].w, insts[i].h);
+                                     insts[i].w, insts[i].h, channels);
             }
         }
 
@@ -692,7 +718,7 @@ int main(int argc, char **argv) {
 #endif
         for (int i = 0; i < n; i++) {
             if (insts[i].op_id < 0) {
-                /* Solid color — row-wise memset */
+                /* Solid color — row-wise fill */
                 uint8_t val = (insts[i].op_id == -2) ? 255 : 0;
                 int sy0 = insts[i].y, sx0 = insts[i].x;
                 for (int yy = 0; yy < insts[i].h; yy++) {
@@ -701,8 +727,18 @@ int main(int argc, char **argv) {
                     int fill_x = sx0, fill_w = insts[i].w;
                     if (fill_x < 0) { fill_w += fill_x; fill_x = 0; }
                     if (fill_x + fill_w > width) fill_w = width - fill_x;
-                    if (fill_w > 0)
-                        memset(&canvas[(size_t)dst_y * width + fill_x], val, (size_t)fill_w);
+                    if (fill_w > 0) {
+                        if (channels == 3) {
+                            uint8_t *dst = &canvas[((size_t)dst_y * width + fill_x) * 3];
+                            for (int px = 0; px < fill_w; px++) {
+                                dst[px*3+0] = val;
+                                dst[px*3+1] = val;
+                                dst[px*3+2] = val;
+                            }
+                        } else {
+                            memset(&canvas[(size_t)dst_y * width + fill_x], val, (size_t)fill_w);
+                        }
+                    }
                 }
                 continue;
             }
@@ -728,19 +764,25 @@ int main(int argc, char **argv) {
 
                 Img src;
                 if (pdf_render_page(pdf_path, page_idx, 1.0f, &src) != 0) continue;
-                img_to_gray(&src, &tile_img);
-                img_free(&src);
-
-                /* Scale directly to output tile size */
-                Img scaled;
-                img_resize_area(&tile_img, &scaled, dw, dh);
-                img_free(&tile_img);
-                tile_img = scaled;
+                if (channels == 3) {
+                    /* Keep BGR — scale directly */
+                    img_resize_area(&src, &tile_img, dw, dh);
+                    img_free(&src);
+                } else {
+                    img_to_gray(&src, &tile_img);
+                    img_free(&src);
+                    /* Scale directly to output tile size */
+                    Img scaled;
+                    img_resize_area(&tile_img, &scaled, dw, dh);
+                    img_free(&tile_img);
+                    tile_img = scaled;
+                }
                 need_free = 1;
             }
 
             /* Blit to canvas — row-wise memcpy (disjoint region, no lock needed) */
             int sy0 = insts[i].y, sx0 = insts[i].x;
+            int tile_channels = tile_img.channels;
             for (int yy = 0; yy < dh; yy++) {
                 int dst_y = sy0 + yy;
                 if (dst_y < 0 || dst_y >= height) continue;
@@ -749,16 +791,17 @@ int main(int argc, char **argv) {
                 if (copy_x < 0) { copy_src_x = -copy_x; copy_w += copy_x; copy_x = 0; }
                 if (copy_x + copy_w > width) copy_w = width - copy_x;
                 if (copy_w > 0) {
-                    memcpy(&canvas[(size_t)dst_y * width + copy_x],
-                           &tile_img.pixels[(size_t)yy * tile_img.stride + copy_src_x],
-                           (size_t)copy_w);
+                    size_t copy_bytes = (size_t)copy_w * tile_channels;
+                    memcpy(&canvas[((size_t)dst_y * width + copy_x) * channels],
+                           &tile_img.pixels[(size_t)yy * tile_img.stride + copy_src_x * tile_channels],
+                           copy_bytes);
                 }
             }
             if (need_free) img_free(&tile_img);
         }
 
         /* ── Push assembled frame to encoder pipeline ──────────────── */
-        pipeline_push(&ep, canvas, canvas_bytes * channels);
+        pipeline_push(&ep, canvas, canvas_bytes);
 
         frames_done++;
         if (!g_cli.quiet && frames_done % 30 == 0) {

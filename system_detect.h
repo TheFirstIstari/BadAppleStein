@@ -25,7 +25,7 @@ SystemConfig system_detect(void);
 
 /*
  * Compute a cache budget from total memory.
- * Returns 0 for < 512 MB, 10% for 512 MB-1 GB, 25% (capped at 2 GB) for >= 1 GB.
+ * Returns 0 for < 512 MB, 10% for 512 MB-1 GB, 25% (capped at 4 GB) for >= 1 GB.
  */
 size_t system_cache_budget(size_t total_memory);
 

@@ -111,7 +111,7 @@ static inline uint32_t feature_l1(const uint8_t* a, const uint8_t* b, int len) {
     }
     // Horizontal sum of uint32x4_t
     uint32x2_t sum_pair = vadd_u32(vget_low_u32(acc), vget_high_u32(acc));
-    uint32_t s = vget_lane_u32(sum_pair, 0) + vget_lane_u32(sum_pair, 1);
+    uint64_t s = (uint64_t)vget_lane_u32(sum_pair, 0) + (uint64_t)vget_lane_u32(sum_pair, 1);
     for (; j < len; j++) {
         int d = (int)a[j] - (int)b[j];
         s += (uint32_t)(d < 0 ? -d : d);
@@ -230,46 +230,149 @@ void match_batch_coarse(const uint8_t* lib, const uint8_t* targets,
     int K = 16;
     if (K > n_pages) K = n_pages;
 
+    uint32_t *merged_dist = NULL;
+    int *merged_best = NULL;
+
 #ifdef _OPENMP
     // ── Coarse stage: OpenMP parallel over pages ──────────────────────
-    int nthreads = omp_get_max_threads();
-    // Per-thread coarse results: each thread tracks top-K per target
-    // For simplicity, we do the coarse stage into shared arrays with atomic updates.
-    // Actually, let's use a simpler approach: parallel coarse matching into
-    // per-thread results, then merge.
-    uint32_t **t_coarse_dist = (uint32_t **)malloc((size_t)nthreads * sizeof(uint32_t *));
-    int **t_coarse_best = (int **)malloc((size_t)nthreads * sizeof(int *));
-    for (int th = 0; th < nthreads; th++) {
-        t_coarse_dist[th] = (uint32_t *)malloc((size_t)num_targets * K * sizeof(uint32_t));
-        t_coarse_best[th] = (int *)malloc((size_t)num_targets * K * sizeof(int));
-        for (int t = 0; t < num_targets * K; t++) {
-            t_coarse_dist[th][t] = 0xFFFFFFFF;
-            t_coarse_best[th][t] = -1;
+    {
+        int nthreads = omp_get_max_threads();
+        int omp_ok = 1;
+        uint32_t **t_coarse_dist = (uint32_t **)malloc((size_t)nthreads * sizeof(uint32_t *));
+        int **t_coarse_best = (int **)malloc((size_t)nthreads * sizeof(int *));
+
+        if (!t_coarse_dist || !t_coarse_best) {
+            omp_ok = 0;
+            free(t_coarse_dist);
+            free(t_coarse_best);
+        }
+
+        if (omp_ok) {
+            for (int th = 0; th < nthreads; th++) {
+                t_coarse_dist[th] = (uint32_t *)malloc((size_t)num_targets * K * sizeof(uint32_t));
+                t_coarse_best[th] = (int *)malloc((size_t)num_targets * K * sizeof(int));
+                if (!t_coarse_dist[th] || !t_coarse_best[th]) {
+                    omp_ok = 0;
+                    break;
+                }
+                for (int t = 0; t < num_targets * K; t++) {
+                    t_coarse_dist[th][t] = 0xFFFFFFFF;
+                    t_coarse_best[th][t] = -1;
+                }
+            }
+        }
+
+        if (omp_ok) {
+            #pragma omp parallel
+            {
+                int th = omp_get_thread_num();
+                uint32_t *td = t_coarse_dist[th];
+                int *tb = t_coarse_best[th];
+
+                #pragma omp for schedule(static)
+                for (int i = 0; i < n_pages; i++) {
+                    const uint8_t* page = &lib[(size_t)i * feat_len];
+                    for (int t = 0; t < num_targets; t++) {
+                        const uint8_t* target = &targets[(size_t)t * feat_len];
+                        uint32_t d = feature_l1(page, target, coarse_len);
+
+                        uint32_t *kd = &td[(size_t)t * K];
+                        int *kb = &tb[(size_t)t * K];
+                        if (d >= kd[K - 1]) continue;
+                        kd[K - 1] = d;
+                        kb[K - 1] = i;
+                        for (int k = K - 2; k >= 0; k--) {
+                            if (kd[k + 1] < kd[k]) {
+                                uint32_t td2 = kd[k]; kd[k] = kd[k + 1]; kd[k + 1] = td2;
+                                int tb2 = kb[k]; kb[k] = kb[k + 1]; kb[k + 1] = tb2;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Merge per-thread top-K results
+            merged_dist = (uint32_t *)malloc((size_t)num_targets * K * sizeof(uint32_t));
+            merged_best = (int *)malloc((size_t)num_targets * K * sizeof(int));
+
+            if (merged_dist && merged_best) {
+                for (int t = 0; t < num_targets; t++) {
+                    for (int k = 0; k < K; k++) {
+                        merged_dist[(size_t)t * K + k] = 0xFFFFFFFF;
+                        merged_best[(size_t)t * K + k] = -1;
+                    }
+                    for (int th = 0; th < nthreads; th++) {
+                        uint32_t *td = &t_coarse_dist[th][(size_t)t * K];
+                        int *kb = &t_coarse_best[th][(size_t)t * K];
+                        for (int k = 0; k < K; k++) {
+                            if (kb[k] < 0) continue;
+                            uint32_t d = td[k];
+                            uint32_t *md = &merged_dist[(size_t)t * K];
+                            int *mb = &merged_best[(size_t)t * K];
+                            if (d >= md[K - 1]) continue;
+                            md[K - 1] = d;
+                            mb[K - 1] = kb[k];
+                            for (int kk = K - 2; kk >= 0; kk--) {
+                                if (md[kk + 1] < md[kk]) {
+                                    uint32_t td2 = md[kk]; md[kk] = md[kk + 1]; md[kk + 1] = td2;
+                                    int tb2 = mb[kk]; mb[kk] = mb[kk + 1]; mb[kk + 1] = tb2;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                free(merged_dist);
+                free(merged_best);
+                merged_dist = NULL;
+                merged_best = NULL;
+            }
+        }
+
+        if (t_coarse_dist) {
+            for (int th = 0; th < nthreads; th++) {
+                free(t_coarse_dist[th]);
+                free(t_coarse_best[th]);
+            }
+            free(t_coarse_dist);
+            free(t_coarse_best);
         }
     }
+#endif
 
-    #pragma omp parallel
-    {
-        int th = omp_get_thread_num();
-        uint32_t *td = t_coarse_dist[th];
-        int *tb = t_coarse_best[th];
+    if (!merged_dist || !merged_best) {
+        merged_dist = (uint32_t *)malloc((size_t)num_targets * K * sizeof(uint32_t));
+        merged_best = (int *)malloc((size_t)num_targets * K * sizeof(int));
 
-        #pragma omp for schedule(static)
+        if (!merged_dist || !merged_best) {
+            free(merged_dist);
+            free(merged_best);
+            for (int t = 0; t < num_targets; t++) results[t] = 0;
+            return;
+        }
+
+        for (int t = 0; t < num_targets; t++) {
+            for (int k = 0; k < K; k++) {
+                merged_dist[(size_t)t * K + k] = 0xFFFFFFFF;
+                merged_best[(size_t)t * K + k] = -1;
+            }
+        }
+
         for (int i = 0; i < n_pages; i++) {
             const uint8_t* page = &lib[(size_t)i * feat_len];
             for (int t = 0; t < num_targets; t++) {
                 const uint8_t* target = &targets[(size_t)t * feat_len];
                 uint32_t d = feature_l1(page, target, coarse_len);
 
-                // Insert into top-K (simple insertion sort in K-element list)
-                uint32_t *kd = &td[(size_t)t * K];
-                int *kb = &tb[(size_t)t * K];
-                // Quick check: is it worse than the K-th best?
+                uint32_t *kd = &merged_dist[(size_t)t * K];
+                int *kb = &merged_best[(size_t)t * K];
                 if (d >= kd[K - 1]) continue;
-                // Insert
                 kd[K - 1] = d;
                 kb[K - 1] = i;
-                // Bubble up
                 for (int k = K - 2; k >= 0; k--) {
                     if (kd[k + 1] < kd[k]) {
                         uint32_t td2 = kd[k]; kd[k] = kd[k + 1]; kd[k + 1] = td2;
@@ -282,89 +385,14 @@ void match_batch_coarse(const uint8_t* lib, const uint8_t* targets,
         }
     }
 
-    // ── Merge per-thread top-K results ────────────────────────────────
-    // For each target, merge all thread-local K-lists and pick overall top-K
-    uint32_t *merged_dist = (uint32_t *)malloc((size_t)num_targets * K * sizeof(uint32_t));
-    int *merged_best = (int *)malloc((size_t)num_targets * K * sizeof(int));
-    for (int t = 0; t < num_targets; t++) {
-        for (int k = 0; k < K; k++) {
-            merged_dist[(size_t)t * K + k] = 0xFFFFFFFF;
-            merged_best[(size_t)t * K + k] = -1;
-        }
-        for (int th = 0; th < nthreads; th++) {
-            uint32_t *td = &t_coarse_dist[th][(size_t)t * K];
-            int *kb = &t_coarse_best[th][(size_t)t * K];
-            for (int k = 0; k < K; k++) {
-                if (kb[k] < 0) continue;
-                uint32_t d = td[k];
-                // Insert into merged top-K
-                uint32_t *md = &merged_dist[(size_t)t * K];
-                int *mb = &merged_best[(size_t)t * K];
-                if (d >= md[K - 1]) continue;
-                md[K - 1] = d;
-                mb[K - 1] = kb[k];
-                for (int kk = K - 2; kk >= 0; kk--) {
-                    if (md[kk + 1] < md[kk]) {
-                        uint32_t td2 = md[kk]; md[kk] = md[kk + 1]; md[kk + 1] = td2;
-                        int tb2 = mb[kk]; mb[kk] = mb[kk + 1]; mb[kk + 1] = tb2;
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    for (int th = 0; th < nthreads; th++) {
-        free(t_coarse_dist[th]);
-        free(t_coarse_best[th]);
-    }
-    free(t_coarse_dist);
-    free(t_coarse_best);
-
-#else
-    // ── Single-threaded coarse stage ──────────────────────────────────
-    uint32_t *merged_dist = (uint32_t *)malloc((size_t)num_targets * K * sizeof(uint32_t));
-    int *merged_best = (int *)malloc((size_t)num_targets * K * sizeof(int));
-    for (int t = 0; t < num_targets; t++) {
-        for (int k = 0; k < K; k++) {
-            merged_dist[(size_t)t * K + k] = 0xFFFFFFFF;
-            merged_best[(size_t)t * K + k] = -1;
-        }
-    }
-
-    for (int i = 0; i < n_pages; i++) {
-        const uint8_t* page = &lib[(size_t)i * feat_len];
-        for (int t = 0; t < num_targets; t++) {
-            const uint8_t* target = &targets[(size_t)t * feat_len];
-            uint32_t d = feature_l1(page, target, coarse_len);
-
-            uint32_t *kd = &merged_dist[(size_t)t * K];
-            int *kb = &merged_best[(size_t)t * K];
-            if (d >= kd[K - 1]) continue;
-            kd[K - 1] = d;
-            kb[K - 1] = i;
-            for (int k = K - 2; k >= 0; k--) {
-                if (kd[k + 1] < kd[k]) {
-                    uint32_t td2 = kd[k]; kd[k] = kd[k + 1]; kd[k + 1] = td2;
-                    int tb2 = kb[k]; kb[k] = kb[k + 1]; kb[k + 1] = tb2;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-#endif
-
     // ── Fine stage: full-feature L1 against top-K candidates ───────────
-    // This runs single-threaded since K is small and targets may share candidates.
     for (int t = 0; t < num_targets; t++) {
         uint32_t best_d = 0xFFFFFFFF;
-        int best_i = 0;
+        int best_i = -1;
         const uint8_t* target = &targets[(size_t)t * feat_len];
         int *kb = &merged_best[(size_t)t * K];
         for (int k = 0; k < K; k++) {
-            if (kb[k] < 0) break;  // no more candidates
+            if (kb[k] < 0) break;
             const uint8_t* page = &lib[(size_t)kb[k] * feat_len];
             uint32_t d = feature_l1_bounded(page, target, feat_len, best_d);
             if (d < best_d) {
@@ -372,6 +400,7 @@ void match_batch_coarse(const uint8_t* lib, const uint8_t* targets,
                 best_i = kb[k];
             }
         }
+        if (best_i == -1) best_i = merged_best[(size_t)t * K];
         results[t] = best_i;
     }
 

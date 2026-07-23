@@ -9,12 +9,14 @@ void img_to_gray(const Img *src, Img *dst) {
         dst->w = src->w; dst->h = src->h; dst->channels = 1;
         dst->stride = src->w;
         dst->pixels = (uint8_t *)malloc((size_t)src->w * src->h);
+        if (!dst->pixels) return;
         memcpy(dst->pixels, src->pixels, (size_t)src->w * src->h);
         return;
     }
     dst->w = src->w; dst->h = src->h; dst->channels = 1;
     dst->stride = src->w;
     dst->pixels = (uint8_t *)malloc((size_t)src->w * src->h);
+    if (!dst->pixels) return;
     const uint8_t *s = src->pixels;
     uint8_t *d = dst->pixels;
     for (int y = 0; y < src->h; y++) {
@@ -34,6 +36,10 @@ void img_resize_area(const Img *src, Img *dst, int nw, int nh) {
     dst->pixels = (uint8_t *)malloc((size_t)nw * nh * src->channels);
     int ch = src->channels;
     int sw = src->w, sh = src->h;
+    if (sw <= 0 || sh <= 0 || nw <= 0 || nh <= 0) {
+        dst->pixels = NULL; dst->w = dst->h = dst->channels = dst->stride = 0;
+        return;
+    }
 
     /* Fast path: exact integer upscale.
      * For integer upscale factors, area resampling equals nearest-neighbor
@@ -94,6 +100,7 @@ void img_threshold_u8(uint8_t *buf, int n, int thr, int maxval) {
 
 int64_t *img_integral(const uint8_t *gray, int w, int h) {
     int64_t *I = (int64_t *)malloc((size_t)(w + 1) * (h + 1) * sizeof(int64_t));
+    if (!I) return NULL;
     int stride = w + 1;
     for (int x = 0; x <= w; x++) I[x] = 0;
     for (int y = 0; y < h; y++) {
@@ -136,12 +143,12 @@ void img_sobel_magnitude(const uint8_t *gray, int w, int h, uint8_t *out) {
     }
     /* Fill border pixels. */
     for (int x = 0; x < w; x++) {
-        out[x] = out[w + x];
-        out[(size_t)(h-1) * w + x] = out[(size_t)(h-2) * w + x];
+        if (h > 1) out[x] = out[w + x];
+        if (h > 2) out[(size_t)(h-1) * w + x] = out[(size_t)(h-2) * w + x];
     }
     for (int y = 0; y < h; y++) {
-        out[(size_t)y * w] = out[(size_t)y * w + 1];
-        out[(size_t)y * w + (w-1)] = out[(size_t)y * w + (w-2)];
+        if (w > 1) out[(size_t)y * w] = out[(size_t)y * w + 1];
+        if (w > 2) out[(size_t)y * w + (w-1)] = out[(size_t)y * w + (w-2)];
     }
 }
 
@@ -158,6 +165,7 @@ void img_compute_feature(const Img *crop, int N, int G, int color, uint8_t *out)
         work.w = crop->w; work.h = crop->h; work.channels = 3;
         work.stride = crop->w * 3;
         work.pixels = (uint8_t *)malloc((size_t)crop->w * crop->h * 3);
+        if (!work.pixels) return;
         for (int i = 0; i < crop->w * crop->h; i++) {
             work.pixels[i * 3 + 0] = crop->pixels[i];
             work.pixels[i * 3 + 1] = crop->pixels[i];
@@ -168,6 +176,7 @@ void img_compute_feature(const Img *crop, int N, int G, int color, uint8_t *out)
         work.w = crop->w; work.h = crop->h; work.channels = crop->channels;
         work.stride = crop->stride;
         work.pixels = (uint8_t *)malloc((size_t)crop->stride * crop->h);
+        if (!work.pixels) return;
         memcpy(work.pixels, crop->pixels, (size_t)crop->stride * crop->h);
     }
 
@@ -191,56 +200,139 @@ void img_compute_feature(const Img *crop, int N, int G, int color, uint8_t *out)
 }
 
 void img_compute_feature_multires(const Img *crop, const int *scales, int n_scales,
-                                   int G, int has_edges, uint8_t *out) {
+                                   int G, int has_edges, int color, uint8_t *out) {
     int idx = 0;
 
-    /* Convert to grayscale once, outside the scale loop. */
+    /* For grayscale-only mode, convert to grayscale once outside the scale loop. */
     Img gray;
-    if (crop->channels == 3) {
-        img_to_gray(crop, &gray);
-    } else {
-        gray.w = crop->w; gray.h = crop->h; gray.channels = 1;
-        gray.stride = crop->w;
-        gray.pixels = crop->pixels;  /* shallow copy */
+    if (!color) {
+        if (crop->channels == 3) {
+            img_to_gray(crop, &gray);
+        } else {
+            gray.w = crop->w; gray.h = crop->h; gray.channels = 1;
+            gray.stride = crop->w;
+            gray.pixels = crop->pixels;  /* shallow copy */
+        }
     }
 
     for (int s = 0; s < n_scales; s++) {
         int N = scales[s];
 
-        /* Area-resample grayscale to N×N. */
-        Img rs;
-        img_resize_area(&gray, &rs, N, N);
-
-        int maxv = (1 << G) - 1;
-
-        /* Grayscale feature: quantize each cell. */
-        for (int y = 0; y < N; y++) {
-            for (int x = 0; x < N; x++) {
-                int v = rs.pixels[(size_t)y * rs.stride + x];
-                int q = (G >= 8) ? v : (v * maxv + 127) / 255;
-                if (q > maxv) q = maxv;
-                out[idx++] = (uint8_t)q;
+        if (color) {
+            /* --- Color mode: single BGR resize, derive gray + edge + color. --- */
+            Img color_work;
+            if (crop->channels == 1) {
+                /* Replicate gray -> BGR. */
+                color_work.w = crop->w; color_work.h = crop->h; color_work.channels = 3;
+                color_work.stride = crop->w * 3;
+                color_work.pixels = (uint8_t *)malloc((size_t)crop->w * crop->h * 3);
+                if (!color_work.pixels) goto done;
+                for (int i = 0; i < crop->w * crop->h; i++) {
+                    color_work.pixels[i*3+0] = crop->pixels[i];
+                    color_work.pixels[i*3+1] = crop->pixels[i];
+                    color_work.pixels[i*3+2] = crop->pixels[i];
+                }
+            } else {
+                color_work = *crop;
             }
-        }
 
-        /* Edge feature: Sobel magnitude, quantize. */
-        if (has_edges) {
-            uint8_t *edge_buf = (uint8_t *)malloc((size_t)N * N);
-            img_sobel_magnitude(rs.pixels, N, N, edge_buf);
+            Img rs_color;
+            img_resize_area(&color_work, &rs_color, N, N);
+            if (crop->channels == 1) img_free(&color_work);
+
+            int maxv = (1 << G) - 1;
+
+            /* Derive grayscale from resized BGR (Rec.601 luma). */
+            uint8_t *gray_buf = (uint8_t *)malloc((size_t)N * N);
+            if (!gray_buf) { img_free(&rs_color); goto done; }
             for (int y = 0; y < N; y++) {
                 for (int x = 0; x < N; x++) {
-                    int v = edge_buf[(size_t)y * N + x];
+                    const uint8_t *p = rs_color.pixels + (size_t)y * rs_color.stride + x * 3;
+                    int v = (int)(0.114 * p[0] + 0.587 * p[1] + 0.299 * p[2]);
+                    if (v > 255) v = 255;
+                    gray_buf[(size_t)y * N + x] = (uint8_t)v;
+                }
+            }
+
+            /* Grayscale feature. */
+            for (int y = 0; y < N; y++) {
+                for (int x = 0; x < N; x++) {
+                    int v = gray_buf[(size_t)y * N + x];
                     int q = (G >= 8) ? v : (v * maxv + 127) / 255;
                     if (q > maxv) q = maxv;
                     out[idx++] = (uint8_t)q;
                 }
             }
-            free(edge_buf);
-        }
 
-        img_free(&rs);
+            /* Edge feature. */
+            if (has_edges) {
+                uint8_t *edge_buf = (uint8_t *)malloc((size_t)N * N);
+                if (!edge_buf) { free(gray_buf); img_free(&rs_color); goto done; }
+                img_sobel_magnitude(gray_buf, N, N, edge_buf);
+                for (int y = 0; y < N; y++) {
+                    for (int x = 0; x < N; x++) {
+                        int v = edge_buf[(size_t)y * N + x];
+                        int q = (G >= 8) ? v : (v * maxv + 127) / 255;
+                        if (q > maxv) q = maxv;
+                        out[idx++] = (uint8_t)q;
+                    }
+                }
+                free(edge_buf);
+            }
+
+            free(gray_buf);
+
+            /* Color feature: BGR channels, quantized. */
+            for (int c = 0; c < 3; c++) {
+                for (int y = 0; y < N; y++) {
+                    for (int x = 0; x < N; x++) {
+                        int v = rs_color.pixels[(size_t)y * rs_color.stride + x * 3 + c];
+                        int q = (G >= 8) ? v : (v * maxv + 127) / 255;
+                        if (q > maxv) q = maxv;
+                        out[idx++] = (uint8_t)q;
+                    }
+                }
+            }
+
+            img_free(&rs_color);
+        } else {
+            /* --- Grayscale-only mode (original code path). --- */
+            Img rs;
+            img_resize_area(&gray, &rs, N, N);
+
+            int maxv = (1 << G) - 1;
+
+            /* Grayscale feature: quantize each cell. */
+            for (int y = 0; y < N; y++) {
+                for (int x = 0; x < N; x++) {
+                    int v = rs.pixels[(size_t)y * rs.stride + x];
+                    int q = (G >= 8) ? v : (v * maxv + 127) / 255;
+                    if (q > maxv) q = maxv;
+                    out[idx++] = (uint8_t)q;
+                }
+            }
+
+            /* Edge feature: Sobel magnitude, quantize. */
+            if (has_edges) {
+                uint8_t *edge_buf = (uint8_t *)malloc((size_t)N * N);
+                if (!edge_buf) { img_free(&rs); goto done; }
+                img_sobel_magnitude(rs.pixels, N, N, edge_buf);
+                for (int y = 0; y < N; y++) {
+                    for (int x = 0; x < N; x++) {
+                        int v = edge_buf[(size_t)y * N + x];
+                        int q = (G >= 8) ? v : (v * maxv + 127) / 255;
+                        if (q > maxv) q = maxv;
+                        out[idx++] = (uint8_t)q;
+                    }
+                }
+                free(edge_buf);
+            }
+
+            img_free(&rs);
+        }
     }
 
-    /* Free gray only if we allocated it. */
-    if (crop->channels == 3) img_free(&gray);
+done:
+    /* Free gray only if we allocated it (grayscale-only mode, 3-channel input). */
+    if (!color && crop->channels == 3) img_free(&gray);
 }

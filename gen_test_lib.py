@@ -38,7 +38,7 @@ import numpy as np
 #  Feature helper (mirrors imgops.c img_compute_feature)
 # ---------------------------------------------------------------------------
 
-def compute_feature(img, scales, g, has_edges):
+def compute_feature(img, scales, g, has_edges, color=False):
     """Compute a multi-resolution feature vector from an image.
     
     Args:
@@ -46,36 +46,41 @@ def compute_feature(img, scales, g, has_edges):
         scales: List of grid sizes (e.g., [32, 64, 128])
         g: Bits per cell (1-8)
         has_edges: If True, include Sobel edge features
+        color: If True, include quantized BGR channels per scale
     
     Returns:
         Feature vector as uint8 numpy array
     """
     if len(img.shape) == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        bgr = img
+    else:
+        gray = img
+        bgr = None
+    
+    max_val = (1 << g) - 1
+    
+    def _quantize(arr):
+        if g == 8:
+            return arr.astype(np.uint8)
+        return np.round(arr.astype(np.float32) / 255.0 * max_val).astype(np.uint8)
     
     features = []
     for N in scales:
-        # Grayscale feature
-        resized = cv2.resize(img, (N, N), interpolation=cv2.INTER_AREA)
-        max_val = (1 << g) - 1
-        if g == 8:
-            quantized = resized.astype(np.uint8)
-        else:
-            quantized = np.round(resized.astype(np.float32) / 255.0 * max_val).astype(np.uint8)
-        features.append(quantized.ravel())
+        resized_gray = cv2.resize(gray, (N, N), interpolation=cv2.INTER_AREA)
+        features.append(_quantize(resized_gray).ravel())
         
-        # Edge feature
         if has_edges:
-            # Sobel edge detection
-            gx = cv2.Sobel(resized, cv2.CV_32F, 1, 0, ksize=3)
-            gy = cv2.Sobel(resized, cv2.CV_32F, 0, 1, ksize=3)
+            gx = cv2.Sobel(resized_gray, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(resized_gray, cv2.CV_32F, 0, 1, ksize=3)
             magnitude = np.sqrt(gx**2 + gy**2)
             magnitude = np.clip(magnitude, 0, 255).astype(np.uint8)
-            if g == 8:
-                edge_quantized = magnitude
-            else:
-                edge_quantized = np.round(magnitude.astype(np.float32) / 255.0 * max_val).astype(np.uint8)
-            features.append(edge_quantized.ravel())
+            features.append(_quantize(magnitude).ravel())
+        
+        if color and bgr is not None:
+            resized_bgr = cv2.resize(bgr, (N, N), interpolation=cv2.INTER_AREA)
+            for ch in range(3):
+                features.append(_quantize(resized_bgr[:, :, ch]).ravel())
     
     return np.concatenate(features)
 
@@ -538,6 +543,8 @@ def main():
                         help="Bits per cell G (default: 1)")
     parser.add_argument("--no-edges", action="store_true",
                         help="Disable edge detection features")
+    parser.add_argument("--color", action="store_true",
+                        help="Include 3-channel BGR color features per scale")
     parser.add_argument("--scales", type=str, default="32,64,128",
                         help="Comma-separated scale levels (default: 32,64,128)")
     parser.add_argument("--page-size", type=int, default=1024,
@@ -550,8 +557,10 @@ def main():
     seed = args.seed
     G = args.bits
     has_edges = not args.no_edges
+    color = args.color
     scales_list = [int(x) for x in args.scales.split(",")]
-    feat_len = sum(N * N for N in scales_list) * (2 if has_edges else 1)
+    channels_per_scale = (1 + (1 if has_edges else 0) + (3 if color else 0))
+    feat_len = sum(N * N * channels_per_scale for N in scales_list)
     page_img_size = args.page_size
     out_dir = args.output
 
@@ -559,7 +568,7 @@ def main():
 
     rng = np.random.RandomState(seed)
 
-    print(f"Generating {n_pages} test pages (scales={scales_list}, G={G}, edges={has_edges}, seed={seed}, size={page_img_size}×{page_img_size})...")
+    print(f"Generating {n_pages} test pages (scales={scales_list}, G={G}, edges={has_edges}, color={color}, seed={seed}, size={page_img_size}×{page_img_size})...")
 
     features = np.zeros((n_pages, feat_len), dtype=np.uint8)
     img_paths = []
@@ -571,7 +580,7 @@ def main():
         cv2.imwrite(img_path, img)
         img_paths.append(img_path)
 
-        features[i] = compute_feature(img, scales_list, G, has_edges)
+        features[i] = compute_feature(img, scales_list, G, has_edges, color=color)
 
     feat_path = os.path.join(out_dir, "features.bin")
     with open(feat_path, "wb") as f:
@@ -583,6 +592,7 @@ def main():
         for s in scales_list:
             f.write(struct.pack("<I", s))              # scale_i
         f.write(struct.pack("<I", has_edges))          # has_edges
+        f.write(struct.pack("<I", 3 if color else 1))  # channels
         f.write(features.tobytes())
     print(f"  wrote {feat_path}  ({n_pages} pages, {feat_len}-byte features)")
 

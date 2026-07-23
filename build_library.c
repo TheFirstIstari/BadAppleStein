@@ -45,7 +45,7 @@ typedef struct { uint8_t *data; int len; int n; } FeatBuf;
 
 static void feat_push(FeatBuf *fb, const uint8_t *feat, int len) {
     uint8_t *nw = (uint8_t *)realloc(fb->data, (size_t)(fb->len + len));
-    if (!nw) return;
+    if (!nw) cli_die("out of memory in feat_push");
     memcpy(nw + fb->len, feat, (size_t)len);
     fb->data = nw; fb->len += len; fb->n += 1;
 }
@@ -63,6 +63,7 @@ static void print_help(void) {
         "Options:\n"
         "  --bits <n>               Bits per cell G, 1-8 (default: 1)\n"
         "  --no-edges               Disable edge detection features\n"
+        "  --color                Include BGR color features (3× larger features, better matching for color sources)\n"
         "  --scales <list>          Comma-separated scale levels (default: 32,64,128)\n"
         "  --multi-scale            Emit 0.5x, 1.0x, 1.5x, 2.0x render variants\n"
         "  --out <file>             Output features.bin (default: features.bin)\n"
@@ -93,6 +94,7 @@ int main(int argc, char **argv) {
     const char *src = argv[1];
     int G = cli_opt_int("bits", 1);
     int has_edges = !cli_opt_bool("no-edges", 0);
+    int color = cli_opt_bool("color", 0);
     int multiscale = cli_opt_bool("multi-scale", 0);
     const char *feat_out = cli_opt_str("out", "features.bin");
     const char *reg_out = "registry.bin";
@@ -127,9 +129,12 @@ int main(int argc, char **argv) {
 
     /* Compute total feature length */
     int feat_len = 0;
-    for (int i = 0; i < n_feat_scales; i++)
-        feat_len += feat_scales[i] * feat_scales[i];
-    if (has_edges) feat_len *= 2;
+    for (int i = 0; i < n_feat_scales; i++) {
+        int N = feat_scales[i];
+        feat_len += N * N;                           /* gray */
+        if (has_edges) feat_len += N * N;             /* edge */
+        if (color) feat_len += N * N * 3;             /* color BGR */
+    }
 
     char **paths = NULL;
     int *page_idxs = NULL;
@@ -165,8 +170,8 @@ int main(int argc, char **argv) {
         cli_die("no sources found in: %s", src);
     }
 
-    cli_info("sources: %d entries | G=%d edges=%d feat_scales=%d render_scales=%d | feat_len=%d",
-             total_sources, G, has_edges, n_feat_scales, n_render_scales, feat_len);
+    cli_info("sources: %d entries | G=%d edges=%d color=%d feat_scales=%d render_scales=%d | feat_len=%d",
+             total_sources, G, has_edges, color, n_feat_scales, n_render_scales, feat_len);
 
     d = opendir(src);
     if (!d) cli_die("cannot reopen sources dir: %s", src);
@@ -183,7 +188,7 @@ int main(int argc, char **argv) {
                     Img sim;
                     if (pdf_render_page(full, pg, render_scales[ri], &sim) != 0) continue;
                     uint8_t *feat = (uint8_t *)malloc(feat_len);
-                    img_compute_feature_multires(&sim, feat_scales, n_feat_scales, G, has_edges, feat);
+                    img_compute_feature_multires(&sim, feat_scales, n_feat_scales, G, has_edges, color, feat);
                     img_free(&sim);
                     feat_push(&fb, feat, feat_len);
                     free(feat);
@@ -191,7 +196,7 @@ int main(int argc, char **argv) {
                         int ncap = cap ? cap * 2 : 256;
                         char **new_paths = realloc(paths, (size_t)ncap * sizeof(char *));
                         int *new_idxs = realloc(page_idxs, (size_t)ncap * sizeof(int));
-                        if (!new_paths || !new_idxs) { free(new_paths); free(new_idxs); free(feat); cli_die("out of memory"); }
+                        if (!new_paths || !new_idxs) { free(new_paths); free(new_idxs); cli_die("out of memory"); }
                         paths = new_paths;
                         page_idxs = new_idxs;
                         cap = ncap;
@@ -216,10 +221,10 @@ int main(int argc, char **argv) {
                 if (render_scales[ri] == 1.0f) {
                     sim = im; sim.pixels = NULL;
                 } else {
-                    img_resize_area(&im, &sim, im.w * (int)render_scales[ri], im.h * (int)render_scales[ri]);
+                    img_resize_area(&im, &sim, (int)(im.w * render_scales[ri] + 0.5f), (int)(im.h * render_scales[ri] + 0.5f));
                 }
                 uint8_t *feat = (uint8_t *)malloc(feat_len);
-                img_compute_feature_multires(&sim, feat_scales, n_feat_scales, G, has_edges, feat);
+                img_compute_feature_multires(&sim, feat_scales, n_feat_scales, G, has_edges, color, feat);
                 if (render_scales[ri] != 1.0f) img_free(&sim);
                 feat_push(&fb, feat, feat_len);
                 free(feat);
@@ -227,7 +232,7 @@ int main(int argc, char **argv) {
                     int ncap = cap ? cap * 2 : 256;
                     char **new_paths = realloc(paths, (size_t)ncap * sizeof(char *));
                     int *new_idxs = realloc(page_idxs, (size_t)ncap * sizeof(int));
-                    if (!new_paths || !new_idxs) { free(new_paths); free(new_idxs); free(feat); cli_die("out of memory"); }
+                    if (!new_paths || !new_idxs) { free(new_paths); free(new_idxs); cli_die("out of memory"); }
                     paths = new_paths;
                     page_idxs = new_idxs;
                     cap = ncap;
@@ -263,6 +268,8 @@ int main(int argc, char **argv) {
         fwrite(&us, 4, 1, f);
     }
     fwrite(&uhas_edges, 4, 1, f);
+    uint32_t uchannels = (uint32_t)(color ? 3 : 1);
+    fwrite(&uchannels, 4, 1, f);
     fwrite(fb.data, 1, (size_t)fb.len, f);
     fclose(f);
 

@@ -128,7 +128,8 @@ static void cache_put(const uint8_t *feat, int pid) {
 typedef struct { double read, gray, solve, feat, match, write; long tiles, hits; } Timings;
 
 /* Forward declaration for solve_full (defined after main). */
-void solve_full(const uint8_t *gray, int w, int h,
+void solve_full(const uint8_t *gray, const uint8_t *color_pixels, int color_stride, int color_channels,
+                int w, int h,
                 const FeatureDB *db, const Registry *reg,
                 int pid_white, int pid_black, int max_block, int hero_min,
                 Inst *manifest, int *nout, uint8_t *tiles, int *ntiles, Timings *t);
@@ -205,11 +206,6 @@ int main(int argc, char **argv) {
     int threads = cli_opt_int("threads", 0);
     cli_set_threads(threads);
 
-    g_feat_len = 0;
-    for (int i = 0; i < g_n_scales; i++)
-        g_feat_len += g_scales[i] * g_scales[i];
-    if (g_has_edges) g_feat_len *= 2;
-
     FeatureDB db; Registry reg;
     if (ba_load_features(feat_path, &db) != 0) {
         cli_die("cannot load features: %s", feat_path);
@@ -230,7 +226,7 @@ int main(int argc, char **argv) {
     if (!vd) cli_die("cannot open video: %s", video_path);
 
     int fw = video_decoder_width(vd), fh = video_decoder_height(vd);
-    int total_frames = (int)video_decoder_fps(vd) * 300; /* estimate */
+    int total_frames = (int)(video_decoder_fps(vd) * 300.0); /* estimate */
     cli_info("video: %dx%d | fps=%.1f | estimating %d frames",
              fw, fh, video_decoder_fps(vd), total_frames);
 
@@ -269,10 +265,13 @@ int main(int argc, char **argv) {
         Img gray; img_to_gray(&frame, &gray);
         t.gray += (double)(clock() - tr) / CLOCKS_PER_SEC;
 
-        Inst *manifest = malloc(sizeof(Inst) * (fw * fh / 64 + 1));
-        uint8_t *tiles = malloc((size_t)db.feat_len * (fw * fh / 64 + 1));
+        int manifest_cap = ((fw+7)/8) * ((fh+7)/8) + 1;
+        Inst *manifest = malloc(sizeof(Inst) * (size_t)manifest_cap);
+        uint8_t *tiles = malloc((size_t)db.feat_len * (size_t)manifest_cap);
+        if (!manifest || !tiles) { free(manifest); free(tiles); cli_die("out of memory"); }
         int n = 0, nt = 0;
-        solve_full(gray.pixels, fw, fh, &db, &reg, pid_white, pid_black,
+        solve_full(gray.pixels, frame.pixels, frame.stride, frame.channels, fw, fh,
+                   &db, &reg, pid_white, pid_black,
                    max_block, hero_min, manifest, &n, tiles, &nt, &t);
 
         for (int k = 0; k < n; k++) if (manifest[k].op_id >= 0) total_tiles++;
@@ -306,6 +305,7 @@ int main(int argc, char **argv) {
     }
     video_decoder_close(vd);
     ba_free_features(&db);
+    ba_free_registry(&reg);
 
     double total_time = (double)(clock() - start) / CLOCKS_PER_SEC;
     double overall_fps = frames_done / (total_time > 0.0 ? total_time : 1.0);
@@ -355,6 +355,7 @@ typedef struct {
 
 static void pool_init(TilePool *p, size_t cap) {
     p->buf = (uint8_t *)malloc(cap);
+    if (!p->buf) { p->cap = 0; p->used = 0; p->count = 0; return; }
     p->cap = cap;
     p->used = 0;
     p->count = 0;
@@ -383,10 +384,14 @@ static void pool_free(TilePool *p) {
     p->buf = NULL; p->cap = 0; p->used = 0; p->count = 0;
 }
 
-void solve_full(const uint8_t *gray, int w, int h,
+void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int color_stride_param, int color_channels_param,
+                int w, int h,
                 const FeatureDB *db, const Registry *reg,
                 int pid_white, int pid_black, int max_block, int hero_min,
                 Inst *manifest, int *nout, uint8_t *tiles, int *ntiles, Timings *t) {
+    const uint8_t *color_pixels = color_pixels_param;
+    int color_stride = color_stride_param;
+    int color_channels = color_channels_param;
     const int CELL = 8;
     /* Build a binary integral image (0/1 after threshold at 127) for exact
      * purity checks, matching the Python reference implementation. */
@@ -470,7 +475,9 @@ void solve_full(const uint8_t *gray, int w, int h,
                 /* Non-hero tile: record spec for parallel feature extraction. */
                 if (n_specs >= spec_cap) {
                     spec_cap *= 2;
-                    specs = (TileSpec *)realloc(specs, (size_t)spec_cap * sizeof(TileSpec));
+                    TileSpec *tmp = (TileSpec *)realloc(specs, (size_t)spec_cap * sizeof(TileSpec));
+                    if (!tmp) { free(specs); specs = NULL; goto done; }
+                    specs = tmp;
                 }
                 int midx = n;  /* manifest index for this tile's placeholder */
                 specs[n_specs].x = x;
@@ -491,7 +498,7 @@ void solve_full(const uint8_t *gray, int w, int h,
     free(sum);
     free(visited);
 
-    if (n_specs == 0) goto done;
+    if (n_specs == 0) { free(specs); goto done; }
 
     /* ═══════════════════════════════════════════════════════════════
      * Phase 2: Pre-allocate feature buffers (pool bump-alloc)
@@ -499,6 +506,7 @@ void solve_full(const uint8_t *gray, int w, int h,
     TilePool pool;
     pool_init(&pool, (size_t)n_specs * feat_len + 4096);
     uint8_t *feat_bufs = pool_alloc(&pool, (size_t)n_specs * feat_len);
+    if (!feat_bufs) { free(specs); goto done; }
 
     /* ═══════════════════════════════════════════════════════════════
      * Phase 3: Two-stage parallel feature extraction
@@ -513,6 +521,7 @@ void solve_full(const uint8_t *gray, int w, int h,
     clock_t tf = clock();
     int coarse_len = g_scales[0] * g_scales[0];  /* e.g. 1024 for 32×32 */
     int *coarse_hit = (int *)malloc((size_t)n_specs * sizeof(int));
+    if (!coarse_hit) { free(specs); goto done; }
     for (int i = 0; i < n_specs; i++) coarse_hit[i] = -1;
     {
 #ifdef _OPENMP
@@ -520,8 +529,9 @@ void solve_full(const uint8_t *gray, int w, int h,
 #else
         int nthreads = 1;
 #endif
-        size_t max_crop_sz = (size_t)max_block * max_block;
+        size_t max_crop_sz = (size_t)max_block * max_block * (db->channels == 3 ? 3 : 1);
         uint8_t *crop_bufs = (uint8_t *)malloc((size_t)nthreads * max_crop_sz);
+        if (!crop_bufs) { free(coarse_hit); free(specs); goto done; }
 
 #ifdef _OPENMP
         #pragma omp parallel
@@ -539,11 +549,21 @@ void solve_full(const uint8_t *gray, int w, int h,
 #endif
             for (int i = 0; i < n_specs; i++) {
                 TileSpec *sp = &specs[i];
-                /* Extract grayscale crop (1 channel) */
-                for (int yy = 0; yy < sp->h; yy++) {
-                    memcpy(my_crop + (size_t)yy * sp->w,
-                           gray + (size_t)(sp->y + yy) * w + sp->x,
-                           (size_t)sp->w);
+                /* Extract crop from frame */
+                if (db->channels == 3) {
+                    /* Extract BGR crop from color frame */
+                    for (int yy = 0; yy < sp->h; yy++) {
+                        memcpy(my_crop + (size_t)yy * sp->w * 3,
+                               color_pixels + (size_t)(sp->y + yy) * color_stride + sp->x * 3,
+                               (size_t)sp->w * 3);
+                    }
+                } else {
+                    /* Extract grayscale crop */
+                    for (int yy = 0; yy < sp->h; yy++) {
+                        memcpy(my_crop + (size_t)yy * sp->w,
+                               gray + (size_t)(sp->y + yy) * w + sp->x,
+                               (size_t)sp->w);
+                    }
                 }
 
                 /* ── Stage A: coarse 1KB feature + cache check ────── */
@@ -551,7 +571,8 @@ void solve_full(const uint8_t *gray, int w, int h,
                 int sw = sp->w, sh = sp->h;
                 int maxv = (1 << db->G) - 1;
                 /* Inline area resize + quantize to N×N (no malloc) */
-                uint8_t coarse_feat[4096]; /* max coarse_len (64×64) */
+                uint8_t *coarse_feat = (uint8_t *)malloc(coarse_len);
+                if (!coarse_feat) continue;
                 for (int dy = 0; dy < N; dy++) {
                     int sy0 = (int)((long long)dy * sh / N);
                     int sy1 = (int)((long long)(dy + 1) * sh / N);
@@ -561,9 +582,16 @@ void solve_full(const uint8_t *gray, int w, int h,
                         int sx1 = (int)((long long)(dx + 1) * sw / N);
                         if (sx1 > sw) sx1 = sw;
                         unsigned long sum = 0;
-                        for (int sy = sy0; sy < sy1; sy++)
-                            for (int sx = sx0; sx < sx1; sx++)
-                                sum += my_crop[(size_t)sy * sw + sx];
+                        for (int sy = sy0; sy < sy1; sy++) {
+                            for (int sx = sx0; sx < sx1; sx++) {
+                                if (db->channels == 3) {
+                                    const uint8_t *p = my_crop + ((size_t)sy * sp->w * 3 + sx * 3);
+                                    sum += (unsigned long)(0.114 * p[0] + 0.587 * p[1] + 0.299 * p[2]);
+                                } else {
+                                    sum += my_crop[(size_t)sy * sw + sx];
+                                }
+                            }
+                        }
                         int area = (sy1 - sy0) * (sx1 - sx0);
                         int v = (area > 0) ? (int)(sum / area) : 0;
                         int q = (db->G >= 8) ? v : (v * maxv + 127) / 255;
@@ -575,16 +603,19 @@ void solve_full(const uint8_t *gray, int w, int h,
                 int pid = -1;
                 if (coarse_cache_lookup(coarse_feat, coarse_len, &pid)) {
                     coarse_hit[i] = pid;  /* skip full feature extraction */
+                    free(coarse_feat);
                     continue;
                 }
+                free(coarse_feat);
 
                 /* ── Stage B: full multi-resolution feature ───────── */
                 Img crop;
-                crop.w = sp->w; crop.h = sp->h; crop.channels = 1;
-                crop.stride = sp->w;
+                crop.w = sp->w; crop.h = sp->h;
+                crop.channels = db->channels;
+                crop.stride = sp->w * db->channels;
                 crop.pixels = my_crop;
                 img_compute_feature_multires(&crop, g_scales, g_n_scales,
-                                              db->G, db->has_edges,
+                                              db->G, db->has_edges, (db->channels == 3),
                                               feat_bufs + (size_t)i * feat_len);
             }
         }
@@ -606,6 +637,7 @@ void solve_full(const uint8_t *gray, int w, int h,
      * Phase 4: Full-cache lookup for remaining (non-coarse-hit) tiles
      * ═══════════════════════════════════════════════════════════════ */
     int *miss_idx = (int *)malloc((size_t)n_specs * sizeof(int));
+    if (!miss_idx) { free(coarse_hit); pool_free(&pool); free(specs); goto done; }
     nt = 0;
     for (int i = 0; i < n_specs; i++) {
         if (coarse_hit[i] >= 0) continue;  /* already resolved */
@@ -629,6 +661,7 @@ void solve_full(const uint8_t *gray, int w, int h,
     if (nt > 0) {
         clock_t tm = clock();
         int *results = (int *)malloc((size_t)nt * sizeof(int));
+        if (!results) { free(coarse_hit); free(miss_idx); pool_free(&pool); free(specs); goto done; }
         int coarse_for_match = g_scales[0] * g_scales[0];
         match_batch_coarse(db->data, tiles, db->n_pages, nt, feat_len, coarse_for_match, results);
         for (int i = 0; i < nt; i++) {

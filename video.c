@@ -85,6 +85,7 @@ int video_decoder_next(VideoDecoder *vd, Img *out) {
             if (ret < 0) return -1;
             /* got a frame */
             uint8_t *dst = (uint8_t *)malloc((size_t)vd->width * vd->height * 3);
+            if (!dst) return -1;
             uint8_t *dst_slices[1]; dst_slices[0] = dst;
             int dst_stride = vd->width * 3;
             sws_scale(vd->sws, (const uint8_t *const *)vd->frame->data, vd->frame->linesize,
@@ -258,6 +259,16 @@ VideoEncoder *video_encoder_open(const char *path, int w, int h, double fps,
     ve->sws = sws_getContext(w, h, AV_PIX_FMT_BGR24, w, h, ve->dst_pix_fmt, SWS_BILINEAR, NULL, NULL, NULL);
     ve->sws_gray8 = sws_getContext(w, h, AV_PIX_FMT_GRAY8, w, h, ve->dst_pix_fmt, SWS_BILINEAR, NULL, NULL, NULL);
     ve->frame = av_frame_alloc();
+    if (!ve->sws || !ve->sws_gray8 || !ve->frame) {
+        sws_freeContext(ve->sws);
+        sws_freeContext(ve->sws_gray8);
+        av_frame_free(&ve->frame);
+        avio_closep(&ve->fmt->pb);
+        avcodec_free_context(&ve->ctx);
+        avformat_free_context(ve->fmt);
+        free(ve);
+        return NULL;
+    }
     ve->frame->format = ve->dst_pix_fmt;
     ve->frame->width = w; ve->frame->height = h;
     ve->frame->pts = 0;
@@ -319,6 +330,7 @@ void video_encoder_close(VideoEncoder *ve) {
     av_write_trailer(ve->fmt);
     if (!(ve->fmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ve->fmt->pb);
     sws_freeContext(ve->sws);
+    sws_freeContext(ve->sws_gray8);
     av_frame_free(&ve->frame);
     av_packet_free(&ve->pkt);
     avcodec_free_context(&ve->ctx);
