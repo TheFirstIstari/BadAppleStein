@@ -6,6 +6,7 @@ class Badapplestein < Formula
   license "MIT"
 
   depends_on "pkg-config" => :build
+  depends_on "libomp" => :recommended
   depends_on "ffmpeg"
   depends_on "mupdf" => :optional
 

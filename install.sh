@@ -5,7 +5,7 @@
 # Creates backward-compatible symlinks for 'arrange' and 'render'.
 #
 # Options:
-#   VERSION=0.1.0 curl ... | sh          Install a specific version
+#   VERSION=1.0.0 curl ... | sh          Install a specific version
 #   BIN_DIR=/usr/local/bin curl ... | sh  Install to a custom directory
 #
 set -e

@@ -24,6 +24,10 @@ extern int arrange_main(int argc, char **argv);
 extern int render_main(int argc, char **argv);
 extern int build_main(int argc, char **argv);
 
+#ifndef VERSION
+#define VERSION "dev"
+#endif
+
 /* ------------------------------------------------------------------ */
 /*  Usage                                                              */
 /* ------------------------------------------------------------------ */
@@ -51,6 +55,7 @@ static void print_usage(void) {
         "  --quiet, -q           Suppress non-error output\n"
         "  --json                JSON output mode\n"
         "  --help, -h            Show this help\n"
+        "  --version, -V        Show version\n"
         "\n"
         "Examples:\n"
         "  badapplestein build ~/Documents/pdfs/\n"
@@ -333,6 +338,11 @@ int main(int argc, char **argv) {
     /* --help / -h shows usage regardless of subcommand */
     if (cli_has("help") || cli_has("h")) {
         print_usage();
+        return 0;
+    }
+
+    if (cli_has("version") || cli_has("V")) {
+        printf("badapplestein %s\n", VERSION);
         return 0;
     }
 
