@@ -31,10 +31,78 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libomp-dev pkg-config
+          sudo apt-get install -y libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libomp-dev pkg-config python3-opencv python3-numpy
 
       - name: Build
         run: make
 
       - name: Smoke test
         run: ./src/badapplestein --help
+
+  benchmark:
+    needs: build
+    runs-on: ubuntu-latest
+    name: Benchmark
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libomp-dev pkg-config python3-opencv python3-numpy
+
+      - name: Generate test video
+        run: |
+          ffmpeg -f lavfi -i color=c=black:s=320x240:r=30:d=5 \
+            -vf "noise=alls=10:allf=t+u,scale=320:240" \
+            -c:v libx264 -pix_fmt yuv420p -y test_input.mp4 2>/dev/null
+
+      - name: Generate test library
+        run: python3 gen_test_lib.py --pages 200 --seed 42 --output test_lib
+
+      - name: Build
+        run: make
+
+      - name: Run encode benchmark
+        id: encode
+        run: |
+          TIME_SECONDS=$(python3 -c "
+import subprocess
+import time
+start = time.time()
+subprocess.run(['./src/badapplestein', 'encode', 'test_input.mp4', 'test_output.mov', '--quiet', '--max-frames', '50', '--keep-manifests'], check=True)
+end = time.time()
+print(f'{end - start:.3f}')
+")
+          echo "total_time=$TIME_SECONDS" >> $GITHUB_OUTPUT
+
+      - name: Export benchmark results to JSON
+        run: |
+          python3 << 'PYEOF'
+import json
+from datetime import datetime
+
+result = {
+    "version": "ci",
+    "platform": "linux",
+    "arch": "x86_64",
+    "total_time": round(float("${{ steps.encode.outputs.total_time }}"), 2),
+    "max_frames": 50,
+    "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "git_sha": "${{ github.sha }}"
+}
+
+with open("benchmark-ci.json", "w") as f:
+    json.dump(result, f, indent=2)
+    
+with open("benchmark-ci.json") as f:
+    print(f.read())
+PYEOF
+
+      - name: Cleanup
+        if: always()
+        run: |
+          make clean 2>/dev/null || true
+          rm -f test_input.mp4 test_output.mov 2>/dev/null || true
+          rm -rf test_lib .badapplestein-manifests-* 2>/dev/null || true
