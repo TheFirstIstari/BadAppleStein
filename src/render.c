@@ -536,9 +536,7 @@ static void print_help(void) {
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
 
-int main(int argc, char **argv) {
-    cli_init();
-    cli_parse(argc, argv);
+int render_main(int argc, char **argv) {
 
     const char *man_dir    = cli_opt_str("manifests", "manifests_greedy");
     const char *reg_path   = cli_opt_str("registry", "registry.bin");

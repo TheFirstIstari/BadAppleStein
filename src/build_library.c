@@ -82,9 +82,7 @@ static void print_help(void) {
     );
 }
 
-int main(int argc, char **argv) {
-    cli_init();
-    cli_parse(argc, argv);
+int build_main(int argc, char **argv) {
 
     if (cli_has("help") || cli_has("h") || argc < 2) {
         print_help();

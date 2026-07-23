@@ -1,0 +1,183 @@
+.TH BADAPPLESTEIN-ENCODE 1 "July 2026" "BadAppleStein 1.0.0" "User Commands"
+.SH NAME
+badapplestein-encode \- encode a video using a source library
+.SH SYNOPSIS
+.B badapplestein encode
+.RB [ options ]
+.I input_video
+.I output_video
+.SH DESCRIPTION
+.B badapplestein encode
+runs a two\-stage pipeline to reconstruct a video as a mosaic of source library
+pages.
+.TP
+.B Stage 1 (arrange)
+Every frame of
+.I input_video
+is divided into a grid of cells.
+Each cell is matched against the feature descriptors in the source library to
+find the closest\-matching page.
+The result is written to an intermediate manifest.
+.TP
+.B Stage 2 (render)
+The matched pages are sampled, scaled, and composited into a grid at the
+target resolution.
+The assembled frames are encoded into
+.I output_video
+using the selected codec.
+.PP
+Intermediate manifests are deleted automatically after a successful render unless
+.B \-\-keep\-manifests
+is specified.
+.SH OPTIONS
+.TP
+.BR \-\-library " " \fIdir\fR
+Path to the source library directory.
+Default:
+.BR ~/.badapplestein/library/ .
+.TP
+.BR \-\-preset " " \fIname\fR
+Resolution preset.
+Valid values:
+.BR 8k (7680x4320),
+.BR 4k (3840x2160),
+.BR 1080p (1920x1080),
+.BR 720p (1280x720).
+Default: determined by the input video dimensions.
+.TP
+.BR \-\-width " " \fIpx\fR
+Output width in pixels.
+Overrides the preset.
+.TP
+.BR \-\-height " " \fIpx\fR
+Output height in pixels.
+Overrides the preset.
+.TP
+.BR \-\-fps " " \fIn\fR
+Output frames per second.
+Defaults to the input video frame rate.
+.TP
+.BR \-\-codec " " \fIname\fR
+Video codec.
+Options:
+.BR prores ,
+.BR h264 .
+Auto\-detected when omitted (see
+.B HARDWARE
+below).
+.TP
+.B \-\-no\-hw
+Disable hardware acceleration.
+Forces software ProRes encoding.
+.TP
+.BR \-\-max\-frames " " \fIn\fR
+Maximum number of frames to process.
+Useful for quick previews and testing.
+.TP
+.BR \-\-threads " " \fIn\fR
+Number of worker threads for matching and rendering.
+Defaults to the number of available CPU cores.
+.TP
+.B \-\-keep\-manifests
+Retain intermediate manifest files after rendering.
+Useful for debugging or re\-rendering without re\-matching.
+.TP
+.B \-\-verbose
+Print detailed progress to stderr, including frame\-by\-frame match statistics.
+.TP
+.B \-\-quiet
+Suppress all non\-error output.
+.TP
+.B \-\-json
+Emit machine\-readable JSON progress messages to stdout.
+.TP
+.BR \-\-help
+Print usage information and exit.
+.SH HARDWARE
+.B badapplestein encode
+auto\-detects the best available hardware encoder at startup:
+.TP
+.B VideoToolbox (macOS)
+Used for ProRes encoding when available.
+Checked first on macOS.
+.TP
+.B VAAPI / NVENC (Linux)
+Used for H.264 encoding on systems with Intel (VAAPI) or NVIDIA (NVENC) GPU
+support.
+.TP
+.B Software fallback
+When no hardware encoder is found, the tool falls back to software\-encoded
+ProRes.
+.PP
+Use
+.B \-\-no\-hw
+to bypass hardware detection entirely, or
+.B \-\-codec
+to force a specific encoder.
+.SH PERFORMANCE
+.TP
+.B Use a local library
+Place the library on fast local storage (SSD) rather than a network mount.
+Matching is I/O\-bound during the arrange stage.
+.TP
+.B Limit threads
+On machines with many cores, setting
+.B \-\-threads
+to slightly below the core count can improve throughput by leaving headroom for
+the OS.
+.TP
+.B Preview first
+Use
+.B \-\-max\-frames
+and a lower preset (720p) to verify results before committing to a full\-length
+encode.
+.TP
+.B Keep manifests
+Run with
+.B \-\-keep\-manifests
+during development so the arrange stage can be skipped on subsequent renders.
+.SH EXAMPLES
+Encode at the default resolution:
+.PP
+.RS
+.nf
+badapplestein encode input.mov output.mov
+.fi
+.RE
+.PP
+Encode at 4K using H.264:
+.PP
+.RS
+.nf
+badapplestein encode \-\-preset 4k \-\-codec h264 input.mov output.mp4
+.fi
+.RE
+.PP
+Quick 720p preview, first 100 frames:
+.PP
+.RS
+.nf
+badapplestein encode \-\-preset 720p \-\-max\-frames 100 input.mov preview.mov
+.fi
+.RE
+.PP
+Encode with software\-only ProRes:
+.PP
+.RS
+.nf
+badapplestein encode \-\-no\-hw \-\-codec prores input.mov output.mov
+.fi
+.RE
+.PP
+Encode with a non\-default library and verbose output:
+.PP
+.RS
+.nf
+badapplestein encode \-\-library /data/library \-\-verbose \-\-preset 4k in.mov out.mov
+.fi
+.RE
+.SH SEE ALSO
+.BR badapplestein (1),
+.BR badapplestein-build (1)
+.SH AUTHORS
+BadAppleStein contributors.

@@ -1,0 +1,119 @@
+.TH BADAPPLESTEIN-BUILD 1 "July 2026" "BadAppleStein 1.0.0" "User Commands"
+.SH NAME
+badapplestein-build \- build a source library from PDFs and images
+.SH SYNOPSIS
+.B badapplestein build
+.RB [ options ]
+.I sources_dir
+.SH DESCRIPTION
+.B badapplestein build
+scans
+.I sources_dir
+for PDF files and image files (PNG, JPEG, TIFF, BMP), extracts multi\-resolution
+feature descriptors from each page or image, and writes two binary files to the
+library directory:
+.B features.bin
+and
+.BR registry.bin .
+.PP
+These files are consumed by
+.BR badapplestein\-encode (1)
+during the arrange stage to match video frames against source pages.
+.SH OPTIONS
+.TP
+.BR \-\-library " " \fIdir\fR
+Output library directory.
+Default:
+.BR ~/.badapplestein/library/ .
+The directory is created if it does not exist.
+.TP
+.BR \-\-bits " " \fIn\fR
+Bit depth for quantised feature descriptors.
+Default: 8.
+.TP
+.B \-\-no\-edges
+Skip Canny edge detection.
+Edge features improve match accuracy but increase build time.
+.TP
+.B \-\-color
+Include colour channel histograms in addition to greyscale features.
+Increases memory usage and file size.
+.TP
+.BR \-\-scales " " \fIn\fR
+Number of scale levels for the multi\-scale feature pyramid.
+Default: 3.
+.TP
+.B \-\-multi\-scale
+Alias for
+.BR \-\-scales\ 3 .
+Included for convenience.
+.TP
+.BR \-\-threads " " \fIn\fR
+Number of worker threads for PDF rendering and feature extraction.
+Defaults to the number of available CPU cores.
+.TP
+.B \-\-verbose
+Print detailed progress to stderr, including per\-file extraction statistics.
+.TP
+.B \-\-quiet
+Suppress all non\-error output.
+.TP
+.B \-\-json
+Emit machine\-readable JSON progress messages to stdout.
+.TP
+.BR \-\-help
+Print usage information and exit.
+.SH OUTPUT
+.TP
+.B features.bin
+Binary blob containing quantised feature descriptors for every page.
+Pages are stored sequentially; the offset for page
+.I n
+is computed from the page dimension metadata in
+.BR registry.bin .
+Each descriptor is a compact histogram (greyscale or colour) at each
+scale level.
+.TP
+.B registry.bin
+Fixed\-size header followed by an array of page records.
+Each record contains:
+.RS
+.IP \(bu 2
+Page index (within the source PDF or image).
+.IP \(bu 2
+Source filename.
+.IP \(bu 2
+Width and height in pixels.
+.IP \(bu 2
+Byte offset and length into
+.BR features.bin .
+.RE
+.SH EXAMPLES
+Build a library from a folder of source documents:
+.PP
+.RS
+.nf
+badapplestein build ~/my\-sources/
+.fi
+.RE
+.PP
+Build with colour features and 5 scale levels:
+.PP
+.RS
+.nf
+badapplestein build \-\-color \-\-scales 5 ~/my\-sources/
+.fi
+.RE
+.PP
+Build into a custom library path with verbose output:
+.PP
+.RS
+.nf
+badapplestein build \-\-library /data/library \-\-verbose ~/my\-sources/
+.fi
+.RE
+.SH SEE ALSO
+.BR badapplestein (1),
+.BR badapplestein-encode (1)
+.SH AUTHORS
+BadAppleStein contributors.

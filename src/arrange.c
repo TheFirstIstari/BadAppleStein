@@ -200,10 +200,7 @@ static void print_help(void) {
     );
 }
 
-int main(int argc, char **argv) {
-    cli_init();
-    cli_parse(argc, argv);
-
+int arrange_main(int argc, char **argv) {
     const char *video_path = cli_opt_str("video", NULL);
     const char *feat_path  = cli_opt_str("features", "features.bin");
     const char *reg_path   = cli_opt_str("registry", "registry.bin");

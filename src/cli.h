@@ -61,4 +61,6 @@ double      cli_opt_dbl(const char *name, double def);
 bool        cli_opt_bool(const char *name, bool def);
 bool        cli_has(const char *name);
 
+void        cli_store(const char *name, const char *value);
+
 #endif /* CLI_H */

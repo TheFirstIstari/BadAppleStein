@@ -1,66 +1,34 @@
-# Python (for gen_test_lib.py and utilities)
-__pycache__/
-*.py[cod]
-
-# Compiled binaries
-arrange
-render
-*.o
-*.so
-*.dylib
-*.exe
-*.out
-*.a
-*.obj
-*.elf
-
-# Legacy C library (in case someone rebuilds)
-libmatch.dylib
-libmatch.so
-
-# Binary / data files
-*.bin
-features.bin
-registry.bin
-signatures.bin
-
-# Generated pickle files
-library.pkl
-
-# Output videos
-*.mov
-*.mp4
-
-# Generated directories
-manifests_greedy/
-atlas_cache/
-test_lib/
-test_manifests/
-
-# Test output
-test_output.mov
-test_output.mp4
-test_output_8k.mov
-
-# Logs
-*.log
-logs/
-core
-
-# Temporary files
-*.swp
-*~
-.#*
-
-# Benchmarks
-benchmark-*.json
-
 # OS
 .DS_Store
 Thumbs.db
 
-# Editor / IDE
-.vscode/
-.idea/
-*.sublime-workspace
-*.sublime-project
+# Compiled binaries
+src/arrange
+src/render
+src/badapplestein
+src/build_library
+src/*.o
+src/*.dylib
+src/*.so
+
+# Binary / data files
+src/*.bin
+features.bin
+registry.bin
+
+# Generated test/build artifacts (large)
+test_manifests/
+manifests_greedy/
+test_lib/
+atlas_cache/
+
+# Output videos
+*.mov
+*.mp4
+badapple.mp4
+
+# Benchmark output
+benchmark-*.json
+
+# Kilo / node
+.kilo/node_modules/

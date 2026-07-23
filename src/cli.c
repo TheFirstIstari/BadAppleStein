@@ -38,7 +38,7 @@ static struct {
 } g_opts[CLI_MAX_OPTS];
 static int g_nopts = 0;
 
-static void cli_store(const char *name, const char *value) {
+void cli_store(const char *name, const char *value) {
     for (int i = 0; i < g_nopts; i++) {
         if (strcmp(g_opts[i].name, name) == 0) {
             snprintf(g_opts[i].value, sizeof(g_opts[i].value), "%s", value);

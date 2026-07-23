@@ -1,0 +1,162 @@
+.TH BADAPPLESTEIN 1 "July 2026" "BadAppleStein 1.0.0" "User Commands"
+.SH NAME
+badapplestein \- reconstruct any video as a mosaic of source library pages
+.SH SYNOPSIS
+.B badapplestein
+.RB [ build | encode ]
+.RB [ options ]
+.I input
+.I output
+.SH DESCRIPTION
+.B badapplestein
+reconstructs any video as a mosaic of pages from a source library of PDFs
+and images.
+The tool operates as a two\-stage pipeline:
+.TP
+.B arrange
+Pattern\-match each video frame against the source library to find the best
+page for each region.
+.TP
+.B render
+Assemble the matched pages into an output video at the target resolution.
+.PP
+When invoked without a subcommand, the tool auto\-detects the input type and
+runs the appropriate stage, or both stages when given raw inputs and a
+destination.
+.SH SUBCOMMANDS
+.TP
+.B badapplestein build
+.I sources_dir
+.RB [ options ]
+.br
+Build a source library from a directory of PDFs and images.
+Extracts multi\-resolution feature descriptors and writes
+.B features.bin
+and
+.BR registry.bin .
+See
+.BR badapplestein-build (1).
+.TP
+.B badapplestein encode
+.I input_video
+.I output_video
+.RB [ options ]
+.br
+Encode a video using a previously built source library.
+Runs the arrange and render stages to produce the final mosaic output.
+See
+.BR badapplestein-encode (1).
+.SH OPTIONS
+.TP
+.BR \-\-library " " \fIdir\fR
+Path to the source library directory.
+Default:
+.BR ~/.badapplestein/library/ .
+.TP
+.BR \-\-preset " " \fIname\fR
+Resolution preset.
+Valid values:
+.BR 8k ,
+.BR 4k ,
+.BR 1080p ,
+.BR 720p .
+.TP
+.BR \-\-width " " \fIpx\fR
+Output width in pixels.
+Overrides the preset width.
+.TP
+.BR \-\-height " " \fIpx\fR
+Output height in pixels.
+Overrides the preset height.
+.TP
+.BR \-\-fps " " \fIn\fR
+Output frames per second.
+Defaults to the input video frame rate.
+.TP
+.BR \-\-codec " " \fIname\fR
+Video codec for the output.
+Options:
+.BR prores ,
+.BR h264 .
+Auto\-detected when omitted.
+.TP
+.BR \-\-no\-hw
+Disable hardware acceleration.
+Forces software encoding even when GPU codecs are available.
+.TP
+.BR \-\-max\-frames " " \fIn\fR
+Maximum number of frames to process.
+Useful for quick previews.
+.TP
+.BR \-\-threads " " \fIn\fR
+Number of worker threads.
+Defaults to the number of available CPU cores.
+.TP
+.B \-\-keep\-manifests
+Retain intermediate manifest files after a successful encode.
+Normally these are cleaned up automatically.
+.TP
+.B \-\-verbose
+Print detailed progress and diagnostic information to stderr.
+.TP
+.B \-\-quiet
+Suppress all non\-error output.
+.TP
+.B \-\-json
+Emit machine\-readable JSON progress and status messages.
+.TP
+.BR \-\-help
+Print usage information and exit.
+.SH FILES
+.TP
+.B ~/.badapplestein/library/
+Default location for the source library.
+Contains
+.B features.bin
+and
+.BR registry.bin .
+.SH EXAMPLES
+Build a library from a folder of manga PDFs and scan images:
+.PP
+.RS
+.nf
+badapplestein build \-\-library ~/my\-library ~/sources/
+.fi
+.RE
+.PP
+Encode a video at 4K using the default library:
+.PP
+.RS
+.nf
+badapplestein encode \-\-preset 4k input.mov output.mov
+.fi
+.RE
+.PP
+Quick preview at 720p, first 300 frames:
+.PP
+.RS
+.nf
+badapplestein encode \-\-preset 720p \-\-max\-frames 300 in.mp4 preview.mov
+.fi
+.RE
+.PP
+Encode with explicit resolution and software\-only encoding:
+.PP
+.RS
+.nf
+badapplestein encode \-\-width 1920 \-\-height 1080 \-\-no\-hw \-\-codec h264 in.mp4 out.mp4
+.fi
+.RE
+.PP
+Build and encode in one pipeline (auto\-detect shortcut):
+.PP
+.RS
+.nf
+badapplestein encode \-\-library ~/my\-library \-\-preset 4k in.mp4 out.mov
+.fi
+.RE
+.SH SEE ALSO
+.BR badapplestein-build (1),
+.BR badapplestein-encode (1)
+.SH AUTHORS
+BadAppleStein contributors.
