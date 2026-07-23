@@ -57,8 +57,9 @@ int pdf_render_page(const char *path, int page_idx, float scale, Img *out) {
     if (!ctx) return -1;
 
     int ret = -1;
+    fz_document *doc = NULL;
     fz_try(ctx) {
-        fz_document *doc = fz_open_document(ctx, path);
+        doc = fz_open_document(ctx, path);
         int n_pages = fz_count_pages(ctx, doc);
         if (page_idx < 0 || page_idx >= n_pages) fz_throw(ctx, FZ_ERROR_GENERIC, "page index out of range");
 
@@ -77,16 +78,26 @@ int pdf_render_page(const char *path, int page_idx, float scale, Img *out) {
         fz_drop_device(ctx, dev);
 
         int w = pix->w, h = pix->h;
+        size_t sz = (size_t)w * (size_t)h * 3;
         out->w = w; out->h = h; out->channels = 3; out->stride = w * 3;
-        out->pixels = (uint8_t *)malloc((size_t)w * h * 3);
-        memcpy(out->pixels, pix->samples, (size_t)w * h * 3);
+        out->pixels = (uint8_t *)malloc(sz);
+        if (!out->pixels) {
+            fz_drop_pixmap(ctx, pix);
+            fz_drop_page(ctx, page);
+            fz_drop_document(ctx, doc);
+            doc = NULL;
+            fz_throw(ctx, FZ_ERROR_GENERIC, "out of memory");
+        }
+        memcpy(out->pixels, pix->samples, sz);
 
         fz_drop_pixmap(ctx, pix);
         fz_drop_page(ctx, page);
         fz_drop_document(ctx, doc);
+        doc = NULL;
         ret = 0;
     }
     fz_catch(ctx) {
+        if (doc) fz_drop_document(ctx, doc);
         ret = -1;
     }
 

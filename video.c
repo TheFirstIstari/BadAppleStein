@@ -53,7 +53,15 @@ VideoDecoder *video_decoder_open(const char *path) {
 
     vd->width = vd->ctx->width;
     vd->height = vd->ctx->height;
-    vd->fps = st->avg_frame_rate.num ? (double)st->avg_frame_rate.num / st->avg_frame_rate.den : 30.0;
+    /* Prefer r_frame_rate (true codec timing) over avg_frame_rate (container
+     * timestamp rate, which can be 2× for videos with duplicate frames). */
+    if (st->r_frame_rate.num && st->r_frame_rate.den) {
+        vd->fps = (double)st->r_frame_rate.num / st->r_frame_rate.den;
+    } else if (st->avg_frame_rate.num && st->avg_frame_rate.den) {
+        vd->fps = (double)st->avg_frame_rate.num / st->avg_frame_rate.den;
+    } else {
+        vd->fps = 30.0;
+    }
 
     vd->sws = sws_getContext(vd->width, vd->height, vd->ctx->pix_fmt,
                               vd->width, vd->height, AV_PIX_FMT_BGR24,
@@ -62,6 +70,15 @@ VideoDecoder *video_decoder_open(const char *path) {
 
     vd->frame = av_frame_alloc();
     vd->pkt = av_packet_alloc();
+    if (!vd->frame || !vd->pkt) {
+        av_frame_free(&vd->frame);
+        av_packet_free(&vd->pkt);
+        sws_freeContext(vd->sws);
+        avcodec_free_context(&vd->ctx);
+        avformat_close_input(&vd->fmt);
+        free(vd);
+        return NULL;
+    }
     return vd;
 }
 
@@ -71,7 +88,7 @@ double video_decoder_fps(VideoDecoder *vd) { return vd->fps; }
 
 int video_decoder_next(VideoDecoder *vd, Img *out) {
     if (vd->eof) return 0;
-    out->pixels = NULL;
+    out->pixels = NULL; out->w = out->h = 0;
     while (1) {
         int ret = av_read_frame(vd->fmt, vd->pkt);
         if (ret < 0) { vd->eof = 1; return 0; }
@@ -84,7 +101,7 @@ int video_decoder_next(VideoDecoder *vd, Img *out) {
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) return -1;
             /* got a frame */
-            uint8_t *dst = (uint8_t *)malloc((size_t)vd->width * vd->height * 3);
+            uint8_t *dst = (uint8_t *)malloc((size_t)vd->width * (size_t)vd->height * 3);
             if (!dst) return -1;
             uint8_t *dst_slices[1]; dst_slices[0] = dst;
             int dst_stride = vd->width * 3;
@@ -160,7 +177,7 @@ int video_image_load(const char *path, Img *out) {
     int ret_val = -1;
     if (got_frame) {
         int w = ctx->width, h = ctx->height;
-        uint8_t *dst = (uint8_t *)malloc((size_t)w * h * 3);
+        uint8_t *dst = (uint8_t *)malloc((size_t)w * (size_t)h * 3);
         if (dst) {
             uint8_t *dst_slices[1] = { dst };
             int dst_stride = w * 3;
@@ -273,6 +290,8 @@ VideoEncoder *video_encoder_open(const char *path, int w, int h, double fps,
     ve->frame->width = w; ve->frame->height = h;
     ve->frame->pts = 0;
     if (av_frame_get_buffer(ve->frame, 0) < 0) {
+        sws_freeContext(ve->sws);
+        sws_freeContext(ve->sws_gray8);
         av_frame_free(&ve->frame);
         avcodec_free_context(&ve->ctx);
         avformat_free_context(ve->fmt);

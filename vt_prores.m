@@ -205,7 +205,8 @@ int vt_prores_write(VTEncoder *enc, const uint8_t *pixels, int width, int height
         CVPixelBufferUnlockBaseAddress(pxbuf, 0);
 
         /* Present at the correct timestamp */
-        CMTime pts = CMTimeMakeWithSeconds(enc->frame_count / enc->fps, 600);
+        double t = (enc->fps > 0.0) ? enc->frame_count / enc->fps : 0.0;
+        CMTime pts = CMTimeMakeWithSeconds(t, 600);
 
         if (![enc->adaptor appendPixelBuffer:pxbuf withPresentationTime:pts]) {
             NSLog(@"[vt_prores] append failed at frame %lld", enc->frame_count);

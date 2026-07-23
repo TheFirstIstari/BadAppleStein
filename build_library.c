@@ -41,12 +41,12 @@ static int load_image_av(const char *path, Img *out) {
     return (r == 1) ? 0 : -1;
 }
 
-typedef struct { uint8_t *data; int len; int n; } FeatBuf;
+typedef struct { uint8_t *data; size_t len; int n; } FeatBuf;
 
-static void feat_push(FeatBuf *fb, const uint8_t *feat, int len) {
-    uint8_t *nw = (uint8_t *)realloc(fb->data, (size_t)(fb->len + len));
+static void feat_push(FeatBuf *fb, const uint8_t *feat, size_t len) {
+    uint8_t *nw = (uint8_t *)realloc(fb->data, fb->len + len);
     if (!nw) cli_die("out of memory in feat_push");
-    memcpy(nw + fb->len, feat, (size_t)len);
+    memcpy(nw + fb->len, feat, len);
     fb->data = nw; fb->len += len; fb->n += 1;
 }
 
@@ -188,9 +188,10 @@ int main(int argc, char **argv) {
                     Img sim;
                     if (pdf_render_page(full, pg, render_scales[ri], &sim) != 0) continue;
                     uint8_t *feat = (uint8_t *)malloc(feat_len);
+                    if (!feat) { img_free(&sim); continue; }
                     img_compute_feature_multires(&sim, feat_scales, n_feat_scales, G, has_edges, color, feat);
                     img_free(&sim);
-                    feat_push(&fb, feat, feat_len);
+                    feat_push(&fb, feat, (size_t)feat_len);
                     free(feat);
                     if (nreg >= cap) {
                         int ncap = cap ? cap * 2 : 256;
@@ -224,9 +225,10 @@ int main(int argc, char **argv) {
                     img_resize_area(&im, &sim, (int)(im.w * render_scales[ri] + 0.5f), (int)(im.h * render_scales[ri] + 0.5f));
                 }
                 uint8_t *feat = (uint8_t *)malloc(feat_len);
+                if (!feat) { if (render_scales[ri] != 1.0f) img_free(&sim); continue; }
                 img_compute_feature_multires(&sim, feat_scales, n_feat_scales, G, has_edges, color, feat);
                 if (render_scales[ri] != 1.0f) img_free(&sim);
-                feat_push(&fb, feat, feat_len);
+                feat_push(&fb, feat, (size_t)feat_len);
                 free(feat);
                 if (nreg >= cap) {
                     int ncap = cap ? cap * 2 : 256;

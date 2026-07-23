@@ -112,8 +112,14 @@ void cli_parse(int argc, char **argv) {
             /* --key=value */
             char *eq = strchr(arg + 2, '=');
             if (eq) {
-                *eq = '\0';
-                cli_store(arg + 2, eq + 1);
+                size_t klen = (size_t)(eq - (arg + 2));
+                char *key = (char *)malloc(klen + 1);
+                if (key) {
+                    memcpy(key, arg + 2, klen);
+                    key[klen] = '\0';
+                    cli_store(key, eq + 1);
+                    free(key);
+                }
             } else if (i + 1 < argc && argv[i + 1][0] != '-') {
                 cli_store(arg + 2, argv[++i]);
             } else {
@@ -262,6 +268,9 @@ void cli_json_start(void) {
 
 void cli_json_field(const char *name, const char *value) {
     if (g_cli.json) {
+        /* NOTE: neither name nor value are JSON-escaped here; embedded "
+         * characters will produce invalid JSON. A future fix should escape
+         * backslash, double-quote, and control characters. */
         fprintf(stderr, "  \"%s\": \"%s\",\n", name, value);
     }
 }

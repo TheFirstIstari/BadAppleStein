@@ -99,7 +99,7 @@ depends = ["build-arrange"]
 
 [tasks.render]
 description = "Stage 2: Render final video from manifests (grayscale, needs mupdf)"
-run = "cd BadAppleStein && ./render --manifests manifests_greedy --registry registry.bin --output Bad_Apple_8K_YOUTUBE.mov --width 7680 --height 4320 --fps 60"
+run = "cd BadAppleStein && ./render --manifests manifests_greedy --registry registry.bin --output Bad_Apple_8K_YOUTUBE.mov --width 7680 --height 4320"
 depends = ["build-render"]
 
 [tasks.run]
@@ -135,7 +135,7 @@ mise run build-render
 echo "--- test: render (5000 frames) ---"
 MISE_REGISTRY="$LIB/registry.bin" \
     ./render --manifests manifests_greedy --registry "$LIB/registry.bin" \
-    --output test_output --width 7680 --height 4320 --fps 60 \
+    --output test_output --width 7680 --height 4320 \
     --max-frames 5000 "$@"
 
 echo "--- test: output ---"
@@ -154,7 +154,7 @@ depends = ["build-arrange"]
 
 [tasks.benchmark-render]
 description = "Benchmark stage 2 (rendering) with timing"
-run = "hyperfine --warmup 1 './render --manifests manifests_greedy --registry registry.bin --output /dev/null --width 7680 --height 4320 --fps 60' --export-json benchmark-render.json"
+run = "hyperfine --warmup 1 './render --manifests manifests_greedy --registry registry.bin --output /dev/null --width 7680 --height 4320' --export-json benchmark-render.json"
 depends = ["build-render"]
 
 [tasks.clean]

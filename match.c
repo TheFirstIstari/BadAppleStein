@@ -13,8 +13,8 @@
 //
 // Distance is L1 (sum of absolute differences) over the feature bytes.
 //
-// OpenMP-parallel over pages in the coarse stage; fine stage is small enough
-// to run single-threaded per target.
+// OpenMP-parallel over pages in the coarse stage and over targets in the fine
+// stage.
 //
 // Build with -fopenmp (Linux) or -Xpreprocessor -fopenmp -lomp (macOS + libomp).
 #include <stdint.h>
@@ -74,7 +74,7 @@ static inline uint32_t feature_l1(const uint8_t* a, const uint8_t* b, int len) {
         int d = (int)a[j] - (int)b[j];
         s += (uint64_t)(d < 0 ? -d : d);
     }
-    return (uint32_t)s;
+    return (s > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32_t)s;
 }
 
 #elif HAS_SIMD && defined(__SSE2__)
@@ -94,7 +94,7 @@ static inline uint32_t feature_l1(const uint8_t* a, const uint8_t* b, int len) {
         int d = (int)a[j] - (int)b[j];
         s += (uint64_t)(d < 0 ? -d : d);
     }
-    return (uint32_t)s;
+    return (s > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32_t)s;
 }
 
 #elif HAS_SIMD && defined(__ARM_NEON)
@@ -116,7 +116,7 @@ static inline uint32_t feature_l1(const uint8_t* a, const uint8_t* b, int len) {
         int d = (int)a[j] - (int)b[j];
         s += (uint32_t)(d < 0 ? -d : d);
     }
-    return s;
+    return (s > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32_t)s;
 }
 
 #else
@@ -139,14 +139,21 @@ static inline uint32_t feature_l1_bounded(const uint8_t* a, const uint8_t* b,
 #if HAS_SIMD && defined(__AVX2__)
     int j = 0;
     __m256i acc = _mm256_setzero_si256();
-    __m256i vbound = _mm256_set1_epi64x(bound);
     for (; j + 32 <= len; j += 32) {
         __m256i va = _mm256_loadu_si256((const __m256i*)(a + j));
         __m256i vb = _mm256_loadu_si256((const __m256i*)(b + j));
         acc = _mm256_add_epi64(acc, _mm256_sad_epu8(va, vb));
-        // Early exit: check if any 64-bit lane exceeds bound
-        __m256i cmp = _mm256_cmpgt_epi64(acc, vbound);
-        if (_mm256_movemask_epi8(cmp) != 0) return bound + 1;
+        // Check every 4 iterations (128 bytes) via horizontal sum to avoid
+        // false positives from per-lane overflow.
+        if (((j + 32) % 128) == 0) {
+            __m128i lo = _mm256_castsi256_si128(acc);
+            __m128i hi = _mm256_extracti128_si256(acc, 1);
+            __m128i sum128 = _mm_add_epi64(lo, hi);
+            uint64_t parts[2];
+            _mm_storeu_si128((__m128i*)parts, sum128);
+            uint64_t s = parts[0] + parts[1];
+            if (s > bound) return bound + 1;
+        }
     }
     __m128i lo = _mm256_castsi256_si128(acc);
     __m128i hi = _mm256_extracti128_si256(acc, 1);
@@ -221,7 +228,9 @@ void match_batch_coarse(const uint8_t* lib, const uint8_t* targets,
         return;
     }
 
-    // If coarse_len == feat_len, fall back to direct matching (no coarse stage)
+    // If coarse_len >= feat_len, the coarse stage already computes the full
+    // distance — the fine stage would be 100% redundant work.
+    int fine_needed = (coarse_len < feat_len);
     if (coarse_len >= feat_len) {
         coarse_len = feat_len;  // ensure consistency
     }
@@ -385,23 +394,34 @@ void match_batch_coarse(const uint8_t* lib, const uint8_t* targets,
         }
     }
 
-    // ── Fine stage: full-feature L1 against top-K candidates ───────────
-    for (int t = 0; t < num_targets; t++) {
-        uint32_t best_d = 0xFFFFFFFF;
-        int best_i = -1;
-        const uint8_t* target = &targets[(size_t)t * feat_len];
-        int *kb = &merged_best[(size_t)t * K];
-        for (int k = 0; k < K; k++) {
-            if (kb[k] < 0) break;
-            const uint8_t* page = &lib[(size_t)kb[k] * feat_len];
-            uint32_t d = feature_l1_bounded(page, target, feat_len, best_d);
-            if (d < best_d) {
-                best_d = d;
-                best_i = kb[k];
+    if (fine_needed) {
+        // ── Fine stage: full-feature L1 against top-K candidates ───────────
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int t = 0; t < num_targets; t++) {
+            uint32_t best_d = 0xFFFFFFFF;
+            int best_i = -1;
+            const uint8_t* target = &targets[(size_t)t * feat_len];
+            int *kb = &merged_best[(size_t)t * K];
+            for (int k = 0; k < K; k++) {
+                if (kb[k] < 0) break;
+                const uint8_t* page = &lib[(size_t)kb[k] * feat_len];
+                uint32_t d = feature_l1_bounded(page, target, feat_len, best_d);
+                if (d < best_d) {
+                    best_d = d;
+                    best_i = kb[k];
+                }
             }
+            if (best_i == -1) best_i = merged_best[(size_t)t * K];
+            results[t] = best_i;
         }
-        if (best_i == -1) best_i = merged_best[(size_t)t * K];
-        results[t] = best_i;
+    } else {
+        // Coarse stage already used the full feature vector — the best
+        // candidate at index 0 is the final answer.
+        for (int t = 0; t < num_targets; t++) {
+            results[t] = merged_best[(size_t)t * K];
+        }
     }
 
     free(merged_dist);

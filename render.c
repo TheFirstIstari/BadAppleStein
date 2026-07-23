@@ -13,11 +13,12 @@
  *
  * Usage:
  *   render --manifests dir --registry registry.bin --output out.mov \
- *          --width W --height H --fps 60 [--channels N] [--threads N] [--verbose] [--quiet] [--json]
+ *          --width W --height H [--fps N] [--channels N] [--threads N] [--verbose] [--quiet] [--json]
  */
 #include "badapple.h"
 #include "imgops.h"
 #include "video.h"
+#include <math.h>
 #include "cli.h"
 #include "pdf.h"
 #include "system_detect.h"
@@ -165,7 +166,7 @@ static void atlas_init(AtlasCache *atlas, size_t budget) {
 
 static void atlas_free(AtlasCache *atlas) {
     for (int i = 0; i < atlas->capacity; i++) {
-        if (atlas->entries[i].valid) img_free(&atlas->entries[i].tile);
+        if (atlas->entries[i].valid == 1) img_free(&atlas->entries[i].tile);
     }
     free(atlas->entries);
     atlas->entries = NULL;
@@ -186,7 +187,8 @@ static AtlasEntry *atlas_lookup(AtlasCache *atlas, int op_id, int tw, int th) {
     unsigned h = atlas_hash(op_id, tw, th);
     for (int probe = 0; probe < atlas->capacity; probe++) {
         int idx = (int)((h + (unsigned)probe) % (unsigned)atlas->capacity);
-        if (!atlas->entries[idx].valid) return NULL;
+        if (atlas->entries[idx].valid == 0) return NULL;
+        if (atlas->entries[idx].valid == 2) continue;
         if (atlas->entries[idx].op_id == op_id &&
             atlas->entries[idx].tile_w == tw &&
             atlas->entries[idx].tile_h == th)
@@ -201,7 +203,8 @@ static AtlasEntry *atlas_lookup_stats(AtlasCache *atlas, int op_id, int tw, int 
     unsigned h = atlas_hash(op_id, tw, th);
     for (int probe = 0; probe < atlas->capacity; probe++) {
         int idx = (int)((h + (unsigned)probe) % (unsigned)atlas->capacity);
-        if (!atlas->entries[idx].valid) { atlas->misses++; return NULL; }
+        if (atlas->entries[idx].valid == 0) { atlas->misses++; return NULL; }
+        if (atlas->entries[idx].valid == 2) continue;
         if (atlas->entries[idx].op_id == op_id &&
             atlas->entries[idx].tile_w == tw &&
             atlas->entries[idx].tile_h == th) {
@@ -218,7 +221,7 @@ static void atlas_evict_lru(AtlasCache *atlas) {
     int oldest_idx = -1;
     uint32_t oldest_tick = UINT32_MAX;
     for (int i = 0; i < atlas->capacity; i++) {
-        if (atlas->entries[i].valid && atlas->entries[i].lru < oldest_tick) {
+        if (atlas->entries[i].valid == 1 && atlas->entries[i].lru < oldest_tick) {
             oldest_tick = atlas->entries[i].lru;
             oldest_idx = i;
         }
@@ -226,7 +229,7 @@ static void atlas_evict_lru(AtlasCache *atlas) {
     if (oldest_idx >= 0) {
         atlas->total_bytes -= atlas->entries[oldest_idx].bytes;
         img_free(&atlas->entries[oldest_idx].tile);
-        atlas->entries[oldest_idx].valid = 0;
+        atlas->entries[oldest_idx].valid = 2;
         atlas->count--;
     }
 }
@@ -248,15 +251,15 @@ static void atlas_insert(AtlasCache *atlas, int op_id, int tw, int th,
         if (!new_entries) {
             atlas->capacity = old_cap;
         } else {
-        /* Rehash existing entries */
+        /* Rehash existing entries (skip tombstones) */
         for (int i = 0; i < old_cap; i++) {
-            if (atlas->entries[i].valid) {
+            if (atlas->entries[i].valid == 1) {
                 unsigned h = atlas_hash(atlas->entries[i].op_id,
                                         atlas->entries[i].tile_w,
                                         atlas->entries[i].tile_h);
                 for (int p = 0; p < atlas->capacity; p++) {
                     int idx = (int)((h + (unsigned)p) % (unsigned)atlas->capacity);
-                    if (!new_entries[idx].valid) {
+                    if (new_entries[idx].valid == 0) {
                         new_entries[idx] = atlas->entries[i];
                         break;
                     }
@@ -268,23 +271,65 @@ static void atlas_insert(AtlasCache *atlas, int op_id, int tw, int th,
         }
     }
 
-    /* Insert */
+    /* Insert — prefer reusing a tombstone slot over an empty one */
     unsigned h = atlas_hash(op_id, tw, th);
+    int tombstone_idx = -1;
     for (int probe = 0; probe < atlas->capacity; probe++) {
         int idx = (int)((h + (unsigned)probe) % (unsigned)atlas->capacity);
-        if (!atlas->entries[idx].valid) {
-            atlas->entries[idx].op_id = op_id;
-            atlas->entries[idx].tile_w = tw;
-            atlas->entries[idx].tile_h = th;
-            atlas->entries[idx].tile.pixels = NULL;
-            img_resize_area(tile, &atlas->entries[idx].tile, tw, th);
-            atlas->entries[idx].bytes = (size_t)tw * th * tile->channels;
-            atlas->entries[idx].valid = 1;
-            atlas->entries[idx].lru = atlas->tick++;
-            atlas->total_bytes += atlas->entries[idx].bytes;
+        if (atlas->entries[idx].valid == 0) {
+            int use_idx = (tombstone_idx >= 0) ? tombstone_idx : idx;
+            atlas->entries[use_idx].op_id = op_id;
+            atlas->entries[use_idx].tile_w = tw;
+            atlas->entries[use_idx].tile_h = th;
+            {
+                Img *dst = &atlas->entries[use_idx].tile;
+                dst->w = tw;
+                dst->h = th;
+                dst->channels = tile->channels;
+                dst->stride = tw * tile->channels;
+                dst->pixels = (uint8_t *)malloc((size_t)tw * th * tile->channels);
+                if (!dst->pixels) return;
+                size_t row_bytes = (size_t)tw * tile->channels;
+                for (int y = 0; y < th; y++)
+                    memcpy(dst->pixels + (size_t)y * dst->stride,
+                           tile->pixels + (size_t)y * tile->stride,
+                           row_bytes);
+            }
+            atlas->entries[use_idx].bytes = (size_t)tw * th * tile->channels;
+            atlas->entries[use_idx].valid = 1;
+            atlas->entries[use_idx].lru = atlas->tick++;
+            atlas->total_bytes += atlas->entries[use_idx].bytes;
             atlas->count++;
             return;
         }
+        if (atlas->entries[idx].valid == 2 && tombstone_idx < 0)
+            tombstone_idx = idx;
+    }
+    /* All slots occupied — if we found a tombstone, reuse it */
+    if (tombstone_idx >= 0) {
+        int use_idx = tombstone_idx;
+        atlas->entries[use_idx].op_id = op_id;
+        atlas->entries[use_idx].tile_w = tw;
+        atlas->entries[use_idx].tile_h = th;
+        {
+            Img *dst = &atlas->entries[use_idx].tile;
+            dst->w = tw;
+            dst->h = th;
+            dst->channels = tile->channels;
+            dst->stride = tw * tile->channels;
+            dst->pixels = (uint8_t *)malloc((size_t)tw * th * tile->channels);
+            if (!dst->pixels) return;
+            size_t row_bytes = (size_t)tw * tile->channels;
+            for (int y = 0; y < th; y++)
+                memcpy(dst->pixels + (size_t)y * dst->stride,
+                       tile->pixels + (size_t)y * tile->stride,
+                       row_bytes);
+        }
+        atlas->entries[use_idx].bytes = (size_t)tw * th * tile->channels;
+        atlas->entries[use_idx].valid = 1;
+        atlas->entries[use_idx].lru = atlas->tick++;
+        atlas->total_bytes += atlas->entries[use_idx].bytes;
+        atlas->count++;
     }
 }
 
@@ -337,6 +382,7 @@ typedef struct {
     int           write_pos;
     int           read_pos;
     int           count;
+    int           encoding;    /* slots currently being encoded by consumer */
     int           stop;          /* signal encoder to exit */
     pthread_mutex_t mutex;
     pthread_cond_t  can_write;   /* main thread waits when queue full */
@@ -345,6 +391,7 @@ typedef struct {
     VTEncoder    *vt;            /* hardware ProRes encoder (NULL if using FFmpeg) */
     int            width, height;
     int            channels;     /* 1 = grayscale, 3 = BGR color */
+    size_t         canvas_bytes; /* pre-allocated buffer size */
     long           frames_encoded;
 } EncodePipeline;
 
@@ -358,60 +405,71 @@ static void *encoder_thread(void *arg) {
             pthread_mutex_unlock(&ep->mutex);
             break;
         }
-        /* Take frame from queue */
-        FrameSlot slot = ep->slots[ep->read_pos];
-        ep->read_pos = (ep->read_pos + 1) % FRAME_QUEUE_SIZE;
+        /* Take frame from queue — find next queued slot */
+        int slot_idx = ep->read_pos;
+        while (ep->slots[slot_idx].valid != 1)
+            slot_idx = (slot_idx + 1) % FRAME_QUEUE_SIZE;
+        uint8_t *pixels = ep->slots[slot_idx].pixels;
+        ep->read_pos = (slot_idx + 1) % FRAME_QUEUE_SIZE;
         ep->count--;
+        ep->encoding++;
         pthread_cond_signal(&ep->can_write);
         pthread_mutex_unlock(&ep->mutex);
 
         /* Encode — dispatch to hardware or software encoder */
         if (ep->vt) {
-            vt_prores_write(ep->vt, slot.pixels, ep->width, ep->height,
+            vt_prores_write(ep->vt, pixels, ep->width, ep->height,
                             ep->width * ep->channels, ep->channels);
         } else {
             Img frame;
             frame.w = ep->width; frame.h = ep->height;
             frame.channels = ep->channels;
             frame.stride = ep->width * ep->channels;
-            frame.pixels = slot.pixels;
+            frame.pixels = pixels;
             video_encoder_write(ep->ve, &frame);
         }
-        free(slot.pixels);
+
+        /* Release buffer back to pool */
+        pthread_mutex_lock(&ep->mutex);
+        ep->slots[slot_idx].valid = 0;
+        ep->encoding--;
+        pthread_cond_signal(&ep->can_write);
+        pthread_mutex_unlock(&ep->mutex);
+
         ep->frames_encoded++;
     }
     return NULL;
 }
 
 static void pipeline_init(EncodePipeline *ep, VideoEncoder *ve, VTEncoder *vt,
-                           int w, int h, int channels) {
+                           int w, int h, int channels, size_t canvas_bytes) {
     memset(ep, 0, sizeof(*ep));
     ep->ve = ve;
     ep->vt = vt;
     ep->width = w;
     ep->height = h;
     ep->channels = channels > 0 ? channels : 1;
+    ep->canvas_bytes = canvas_bytes;
     pthread_mutex_init(&ep->mutex, NULL);
     pthread_cond_init(&ep->can_write, NULL);
     pthread_cond_init(&ep->can_read, NULL);
-    for (int i = 0; i < FRAME_QUEUE_SIZE; i++)
-        ep->slots[i].pixels = NULL;
+    for (int i = 0; i < FRAME_QUEUE_SIZE; i++) {
+        ep->slots[i].pixels = (uint8_t *)malloc(canvas_bytes);
+        ep->slots[i].valid = 0;
+    }
 }
 
 static void pipeline_push(EncodePipeline *ep, const uint8_t *pixels, size_t nbytes) {
     pthread_mutex_lock(&ep->mutex);
-    while (ep->count >= FRAME_QUEUE_SIZE)
+    while (ep->count + ep->encoding >= FRAME_QUEUE_SIZE)
         pthread_cond_wait(&ep->can_write, &ep->mutex);
+    /* Find a free slot (valid == 0) */
     int slot = ep->write_pos;
-    ep->slots[slot].pixels = (uint8_t *)malloc(nbytes);
-    if (!ep->slots[slot].pixels) {
-        pthread_mutex_unlock(&ep->mutex);
-        fprintf(stderr, "warning: frame dropped (malloc failed)\n");
-        return;
-    }
+    while (ep->slots[slot].valid != 0)
+        slot = (slot + 1) % FRAME_QUEUE_SIZE;
     memcpy(ep->slots[slot].pixels, pixels, nbytes);
     ep->slots[slot].valid = 1;
-    ep->write_pos = (ep->write_pos + 1) % FRAME_QUEUE_SIZE;
+    ep->write_pos = (slot + 1) % FRAME_QUEUE_SIZE;
     ep->count++;
     pthread_cond_signal(&ep->can_read);
     pthread_mutex_unlock(&ep->mutex);
@@ -424,6 +482,13 @@ static void pipeline_flush(EncodePipeline *ep) {
     pthread_mutex_unlock(&ep->mutex);
 }
 
+static void pipeline_shutdown(EncodePipeline *ep) {
+    for (int i = 0; i < FRAME_QUEUE_SIZE; i++) {
+        free(ep->slots[i].pixels);
+        ep->slots[i].pixels = NULL;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /*  Help                                                               */
 /* ------------------------------------------------------------------ */
@@ -434,15 +499,16 @@ static void print_help(void) {
         "\n"
         "Usage:\n"
         "  render --manifests <dir> --registry <file> --output <file> \\\n"
-        "         --width W --height H --fps N [options]\n"
+        "         --width W --height H [--fps N] [options]\n"
         "\n"
         "Required:\n"
         "  --manifests <dir>       Directory with manifest .bin files\n"
         "  --registry <file>       registry.bin from build step\n"
         "  --output <file>         Output video file (.mov)\n"
         "  --width <n>             Output frame width\n"
-        "  --height <n>            Output frame height\n"
-        "  --fps <n>               Output frame rate\n"
+        "  --height <n>            Output frame height (auto-computed from source\n"
+        "                           aspect ratio if omitted)\n"
+        "  --fps <n>               Output frame rate (auto-detect from source if omitted)\n"
         "\n"
         "Options:\n"
         "  --channels <n>          1=grayscale (default), 3=BGR color\n"
@@ -479,9 +545,9 @@ int main(int argc, char **argv) {
     char output_buf[2048];
     snprintf(output_buf, sizeof(output_buf), "%s", cli_opt_str("output", "output.mov"));
     char *output           = output_buf;
-    int width              = cli_opt_int("width", 7680);
-    int height             = cli_opt_int("height", 4320);
-    double fps             = cli_opt_dbl("fps", 60.0);
+    int width              = cli_opt_int("width", 0);
+    int height             = cli_opt_int("height", 0);
+    double fps             = cli_opt_dbl("fps", 0.0);
     const char *codec      = cli_opt_str("codec", "prores_ks");
     const char *pix_fmt    = cli_opt_str("pix-fmt", "yuv422p10le");
     int threads            = cli_opt_int("threads", 0);
@@ -520,7 +586,7 @@ int main(int argc, char **argv) {
                 size_t olen = strlen(output);
                 if (olen >= 4 && strcasecmp(output + olen - 4, ".mp4") == 0) {
                     cli_info("note: output extension changed to .mov for hardware ProRes");
-                    strcpy(output + olen - 3, "mov");
+                    if (olen >= 4) strcpy(output + olen - 3, "mov");
                 } else if (olen < 4 || output[olen - 4] != '.') {
                     if (olen + 5 <= sizeof(output_buf)) {
                         strcat(output, ".mov");
@@ -570,8 +636,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    cli_info("render: %dx%d @ %.1f fps %s → %s", width, height, fps,
-             channels == 3 ? "(color)" : "(grayscale)", output);
     cli_info("system: %ld cores | %zu MB RAM | %d threads | cache %s (%zu MB)",
              sys.cpu_cores,
              sys.total_memory_bytes / (1024 * 1024),
@@ -595,11 +659,14 @@ int main(int argc, char **argv) {
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (!has_suffix(de->d_name, ".bin")) continue;
+        if (strcmp(de->d_name, "fps.bin") == 0) continue;
         char full[2048];
         snprintf(full, sizeof(full), "%s/%s", man_dir, de->d_name);
         if (n_manifests >= cap) {
             cap = cap ? cap * 2 : 256;
-            manifest_paths = (char **)realloc(manifest_paths, (size_t)cap * sizeof(char *));
+            char **tmp = realloc(manifest_paths, (size_t)cap * sizeof(char *));
+            if (!tmp) { free(manifest_paths); cli_die("out of memory"); }
+            manifest_paths = tmp;
         }
         manifest_paths[n_manifests++] = strdup(full);
     }
@@ -611,9 +678,51 @@ int main(int argc, char **argv) {
     /* Sort manifests by filename (frame order) */
     qsort(manifest_paths, (size_t)n_manifests, sizeof(char *), cmp_manifest);
 
+    /* ── Auto-detect source dimensions from first manifest ──────────
+     * Read src_w/src_h from the manifest header (first 8 bytes) to compute
+     * output dimensions that preserve the source aspect ratio. */
+    {
+        FILE *pf = fopen(manifest_paths[0], "rb");
+        if (pf) {
+            uint32_t msw = 0, msh = 0;
+            if (fread(&msw, 4, 1, pf) == 1 && fread(&msh, 4, 1, pf) == 1 && msw > 0 && msh > 0) {
+                double src_aspect = (double)msw / (double)msh;
+                if (width <= 0 && height <= 0) {
+                    /* Neither specified: match source resolution */
+                    width = (int)msw; height = (int)msh;
+                } else if (width > 0 && height <= 0) {
+                    /* Width only: compute height from aspect ratio */
+                    height = (int)((double)width / src_aspect + 0.5);
+                    height = (height / 2) * 2;
+                } else if (height > 0 && width <= 0) {
+                    /* Height only: compute width from aspect ratio */
+                    width = (int)((double)height * src_aspect + 0.5);
+                    width = (width / 2) * 2;
+                } else {
+                    /* Both specified: fit within bounding box preserving aspect.
+                     * E.g. 7680×4320 with 4:3 source → 5760×4320 (pillarbox). */
+                    double dst_aspect = (double)width / (double)height;
+                    if (dst_aspect > src_aspect) {
+                        /* Output is wider than source → shrink width */
+                        width = (int)((double)height * src_aspect + 0.5);
+                        width = (width / 2) * 2;
+                    } else {
+                        /* Output is taller than source → shrink height */
+                        height = (int)((double)width / src_aspect + 0.5);
+                        height = (height / 2) * 2;
+                    }
+                }
+            }
+            fclose(pf);
+        }
+        if (width <= 0) width = 7680;
+        if (height <= 0) height = 4320;
+    }
+
     /* ── Pre-load all manifests into memory ───────────────────── */
     typedef struct { Inst *insts; int n; } LoadedManifest;
     LoadedManifest *loaded = (LoadedManifest *)calloc((size_t)n_manifests, sizeof(LoadedManifest));
+    if (!loaded) cli_die("cannot allocate loaded manifests");
     int loaded_count = 0;
     for (int i = 0; i < n_manifests; i++) {
         Inst *insts = NULL; int n = 0;
@@ -628,6 +737,34 @@ int main(int argc, char **argv) {
         loaded_count++;
     }
     cli_info("loaded: %d manifests (%d frames)", loaded_count, n_manifests);
+
+    /* Auto-detect fps from sidecar written by arrange.
+     * If --fps was explicitly specified, use it but warn if it differs. */
+    {
+        double src_fps = 0.0;
+        char fps_path[2048];
+        snprintf(fps_path, sizeof(fps_path), "%s/fps.bin", man_dir);
+        FILE *fpsf = fopen(fps_path, "rb");
+        if (fpsf) {
+            fread(&src_fps, sizeof(double), 1, fpsf);
+            fclose(fpsf);
+        }
+        if (fps <= 0.0) {
+            /* No --fps specified: use fps.bin */
+            if (src_fps > 0.0) {
+                fps = src_fps;
+                cli_info("auto-detected fps: %.2f (from source video)", fps);
+            }
+        } else if (src_fps > 0.0 && fabs(fps - src_fps) > 0.1) {
+            /* --fps specified but differs from source: warn */
+            cli_warn("fps mismatch: --fps=%.2f but source video is %.2f fps "
+                     "(output may play at wrong speed)", fps, src_fps);
+        }
+    }
+    if (fps <= 0.0) fps = 30.0;  /* safe fallback */
+
+    cli_info("render: %dx%d @ %.1f fps %s → %s", width, height, fps,
+             channels == 3 ? "(color)" : "(grayscale)", output);
 
     /* ── Open encoder ─────────────────────────────────────────── */
     VideoEncoder *ve = NULL;
@@ -672,7 +809,7 @@ int main(int argc, char **argv) {
     }
 
     /* ── Single canvas buffer (pipeline_push copies into queue) ── */
-    size_t canvas_bytes = (size_t)width * height * channels;
+    size_t canvas_bytes = (size_t)width * (size_t)height * (size_t)channels;
     uint8_t *canvas = (uint8_t *)calloc(canvas_bytes, 1);
     if (!canvas) cli_die("cannot allocate canvas");
 
@@ -682,7 +819,7 @@ int main(int argc, char **argv) {
 
     /* ── Initialize encode pipeline ───────────────────────────── */
     EncodePipeline ep;
-    pipeline_init(&ep, ve, vt, width, height, channels);
+    pipeline_init(&ep, ve, vt, width, height, channels, canvas_bytes);
     pthread_t enc_thread;
     pthread_create(&enc_thread, NULL, encoder_thread, &ep);
 
@@ -696,108 +833,109 @@ int main(int argc, char **argv) {
         cli_info("max-frames: %d (of %d)", max_frames_actual, n_manifests);
 
     for (int fi = 0; fi < max_frames_actual; fi++) {
-        if (loaded[fi].n == 0) continue;
         Inst *insts = loaded[fi].insts;
         int n = loaded[fi].n;
 
         /* Clear canvas */
         memset(canvas, 0, canvas_bytes);
 
-        /* ── Pre-populate atlas cache for this frame's tiles ── */
-        if (atlas.enabled) {
-            for (int i = 0; i < n; i++) {
-                if (insts[i].op_id >= 0 && insts[i].w > 0 && insts[i].h > 0)
-                    atlas_cache_tile(&atlas, &reg, insts[i].op_id,
-                                     insts[i].w, insts[i].h, channels);
+        if (n > 0 && insts) {
+            /* ── Pre-populate atlas cache for this frame's tiles ── */
+            if (atlas.enabled) {
+                for (int i = 0; i < n; i++) {
+                    if (insts[i].op_id >= 0 && insts[i].w > 0 && insts[i].h > 0)
+                        atlas_cache_tile(&atlas, &reg, insts[i].op_id,
+                                         insts[i].w, insts[i].h, channels);
+                }
             }
-        }
 
-        /* ── Blit instructions (OpenMP parallel) ───────────────────── */
+            /* ── Blit instructions (OpenMP parallel) ───────────────────── */
 #ifdef _OPENMP
-        #pragma omp parallel for schedule(dynamic) if(n > 4)
+            #pragma omp parallel for schedule(dynamic) if(n > 4)
 #endif
-        for (int i = 0; i < n; i++) {
-            if (insts[i].op_id < 0) {
-                /* Solid color — row-wise fill */
-                uint8_t val = (insts[i].op_id == -2) ? 255 : 0;
-                int sy0 = insts[i].y, sx0 = insts[i].x;
-                for (int yy = 0; yy < insts[i].h; yy++) {
-                    int dst_y = sy0 + yy;
-                    if (dst_y < 0 || dst_y >= height) continue;
-                    int fill_x = sx0, fill_w = insts[i].w;
-                    if (fill_x < 0) { fill_w += fill_x; fill_x = 0; }
-                    if (fill_x + fill_w > width) fill_w = width - fill_x;
-                    if (fill_w > 0) {
-                        if (channels == 3) {
-                            uint8_t *dst = &canvas[((size_t)dst_y * width + fill_x) * 3];
-                            for (int px = 0; px < fill_w; px++) {
-                                dst[px*3+0] = val;
-                                dst[px*3+1] = val;
-                                dst[px*3+2] = val;
+            for (int i = 0; i < n; i++) {
+                if (insts[i].op_id < 0) {
+                    /* Solid color — row-wise fill */
+                    uint8_t val = (insts[i].op_id == -2) ? 255 : 0;
+                    int sy0 = insts[i].y, sx0 = insts[i].x;
+                    for (int yy = 0; yy < insts[i].h; yy++) {
+                        int dst_y = sy0 + yy;
+                        if (dst_y < 0 || dst_y >= height) continue;
+                        int fill_x = sx0, fill_w = insts[i].w;
+                        if (fill_x < 0) { fill_w += fill_x; fill_x = 0; }
+                        if (fill_x + fill_w > width) fill_w = width - fill_x;
+                        if (fill_w > 0) {
+                            if (channels == 3) {
+                                uint8_t *dst = &canvas[((size_t)dst_y * width + fill_x) * 3];
+                                for (int px = 0; px < fill_w; px++) {
+                                    dst[px*3+0] = val;
+                                    dst[px*3+1] = val;
+                                    dst[px*3+2] = val;
+                                }
+                            } else {
+                                memset(&canvas[(size_t)dst_y * width + fill_x], val, (size_t)fill_w);
                             }
-                        } else {
-                            memset(&canvas[(size_t)dst_y * width + fill_x], val, (size_t)fill_w);
                         }
                     }
+                    continue;
                 }
-                continue;
-            }
 
-            if (insts[i].op_id >= reg.n) continue;
+                if (insts[i].op_id >= reg.n) continue;
 
-            int dw = insts[i].w, dh = insts[i].h;
-            if (dw <= 0 || dh <= 0) continue;
+                int dw = insts[i].w, dh = insts[i].h;
+                if (dw <= 0 || dh <= 0) continue;
 
-            /* Check tile-level atlas cache first */
-            AtlasEntry *cached = atlas_lookup(&atlas, insts[i].op_id, dw, dh);
+                /* Check tile-level atlas cache first */
+                AtlasEntry *cached = atlas_lookup(&atlas, insts[i].op_id, dw, dh);
 
-            Img tile_img;
-            int need_free = 0;
+                Img tile_img;
+                int need_free = 0;
 
-            if (cached) {
-                /* Cache hit — tile already scaled to (dw × dh) */
-                tile_img = cached->tile;
-            } else {
-                /* Cache miss — render source page and scale on-the-fly */
-                const char *pdf_path = reg.entries[insts[i].op_id].pdf_path;
-                int page_idx = reg.entries[insts[i].op_id].page_idx;
-
-                Img src;
-                if (pdf_render_page(pdf_path, page_idx, 1.0f, &src) != 0) continue;
-                if (channels == 3) {
-                    /* Keep BGR — scale directly */
-                    img_resize_area(&src, &tile_img, dw, dh);
-                    img_free(&src);
+                if (cached) {
+                    /* Cache hit — tile already scaled to (dw × dh) */
+                    tile_img = cached->tile;
                 } else {
-                    img_to_gray(&src, &tile_img);
-                    img_free(&src);
-                    /* Scale directly to output tile size */
-                    Img scaled;
-                    img_resize_area(&tile_img, &scaled, dw, dh);
-                    img_free(&tile_img);
-                    tile_img = scaled;
-                }
-                need_free = 1;
-            }
+                    /* Cache miss — render source page and scale on-the-fly */
+                    const char *pdf_path = reg.entries[insts[i].op_id].pdf_path;
+                    int page_idx = reg.entries[insts[i].op_id].page_idx;
 
-            /* Blit to canvas — row-wise memcpy (disjoint region, no lock needed) */
-            int sy0 = insts[i].y, sx0 = insts[i].x;
-            int tile_channels = tile_img.channels;
-            for (int yy = 0; yy < dh; yy++) {
-                int dst_y = sy0 + yy;
-                if (dst_y < 0 || dst_y >= height) continue;
-                int copy_x = sx0, copy_src_x = 0;
-                int copy_w = dw;
-                if (copy_x < 0) { copy_src_x = -copy_x; copy_w += copy_x; copy_x = 0; }
-                if (copy_x + copy_w > width) copy_w = width - copy_x;
-                if (copy_w > 0) {
-                    size_t copy_bytes = (size_t)copy_w * tile_channels;
-                    memcpy(&canvas[((size_t)dst_y * width + copy_x) * channels],
-                           &tile_img.pixels[(size_t)yy * tile_img.stride + copy_src_x * tile_channels],
-                           copy_bytes);
+                    Img src;
+                    if (pdf_render_page(pdf_path, page_idx, 1.0f, &src) != 0) continue;
+                    if (channels == 3) {
+                        /* Keep BGR — scale directly */
+                        img_resize_area(&src, &tile_img, dw, dh);
+                        img_free(&src);
+                    } else {
+                        img_to_gray(&src, &tile_img);
+                        img_free(&src);
+                        /* Scale directly to output tile size */
+                        Img scaled;
+                        img_resize_area(&tile_img, &scaled, dw, dh);
+                        img_free(&tile_img);
+                        tile_img = scaled;
+                    }
+                    need_free = 1;
                 }
+
+                /* Blit to canvas — row-wise memcpy (disjoint region, no lock needed) */
+                int sy0 = insts[i].y, sx0 = insts[i].x;
+                int tile_channels = tile_img.channels;
+                for (int yy = 0; yy < dh; yy++) {
+                    int dst_y = sy0 + yy;
+                    if (dst_y < 0 || dst_y >= height) continue;
+                    int copy_x = sx0, copy_src_x = 0;
+                    int copy_w = dw;
+                    if (copy_x < 0) { copy_src_x = -copy_x; copy_w += copy_x; copy_x = 0; }
+                    if (copy_x + copy_w > width) copy_w = width - copy_x;
+                    if (copy_w > 0) {
+                        size_t copy_bytes = (size_t)copy_w * tile_channels;
+                        memcpy(&canvas[((size_t)dst_y * width + copy_x) * channels],
+                               &tile_img.pixels[(size_t)yy * tile_img.stride + copy_src_x * tile_channels],
+                               copy_bytes);
+                    }
+                }
+                if (need_free) img_free(&tile_img);
             }
-            if (need_free) img_free(&tile_img);
         }
 
         /* ── Push assembled frame to encoder pipeline ──────────────── */
@@ -822,6 +960,7 @@ int main(int argc, char **argv) {
     /* ── Cleanup ──────────────────────────────────────────────── */
     if (vt) vt_prores_close(vt);
     else video_encoder_close(ve);
+    pipeline_shutdown(&ep);
     pthread_mutex_destroy(&ep.mutex);
     pthread_cond_destroy(&ep.can_write);
     pthread_cond_destroy(&ep.can_read);

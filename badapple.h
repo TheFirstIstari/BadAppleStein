@@ -114,6 +114,7 @@ static inline int ba_load_features(const char *path, FeatureDB *db) {
         free(scales); free(buf); return -1;
     }
     if (len < header_len) { free(scales); free(buf); return -1; }
+    if ((uint64_t)n * feat_len > (1ULL << 40)) return -1;  /* sanity: reject >1 TB */
     size_t need = header_len + (size_t)n * feat_len;
     if (need < header_len || need > len) { free(scales); free(buf); return -1; }
     db->n_pages = (int)n;
@@ -153,6 +154,7 @@ static inline int ba_load_registry(const char *path, Registry *reg) {
     if (ba_read_file(path, &buf, &len) != 0) return -1;
     if (len < 4) { free(buf); return -1; }
     uint32_t n; memcpy(&n, buf, 4);
+    if (n > (uint32_t)len / 5) { free(buf); return -1; }
     RegEntry *e = (RegEntry *)calloc(n ? n : 1, sizeof(RegEntry));
     if (!e) { free(buf); return -1; }
     size_t off = 4;
@@ -160,10 +162,11 @@ static inline int ba_load_registry(const char *path, Registry *reg) {
         if (off + 8 > len) { free(e); free(buf); return -1; }
         int32_t page_idx; uint32_t plen;
         memcpy(&page_idx, buf + off, 4); off += 4;
+        if (page_idx < 0) { free(e); free(buf); return -1; }
         memcpy(&plen, buf + off, 4); off += 4;
         if (off + plen > len) { free(e); free(buf); return -1; }
         char *p = (char *)malloc(plen + 1);
-        if (!p) { free(e); free(buf); return -1; }
+        if (!p) { for (int j = 0; j < i; j++) free(e[j].pdf_path); free(e); free(buf); return -1; }
         memcpy(p, buf + off, plen); p[plen] = '\0';
         e[i].pdf_path = p; e[i].page_idx = page_idx;
         off += plen;

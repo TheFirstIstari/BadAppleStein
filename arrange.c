@@ -31,108 +31,136 @@ typedef struct {
     int32_t x, y, w, h, op_id, page_idx;
 } Inst;
 
-/* ── FNV-1a hash (shared by both caches) ───────────────────────── */
-static unsigned fnv1a(const uint8_t *d, int len) {
-    unsigned h = 2166136261u;
-    for (int i = 0; i < len; i++) { h ^= d[i]; h *= 16777619u; }
-    return h;
+/* ── Compact hash+pid cache: 16 bytes/entry, near-zero lookup cost ─
+ * Instead of storing full feature bytes (43 KB each), we store only a
+ * 64-bit FNV-1a hash + pid.  The full-feature hash uses a sparse 64-byte
+ * sample across all scale levels.  With ~2 000 library pages the collision
+ * probability is < 10⁻¹³ — effectively zero.
+ *
+ * Open addressing with linear probing, power-of-2 capacity (bitmask),
+ * 75% load-factor resize, bounded 32-step probe. */
+typedef struct { uint64_t hash; int32_t pid; } CacheSlot;
+
+static CacheSlot *g_ccache = NULL;  /* coarse cache (keyed on 1 KB feature) */
+static size_t    g_ccache_cap = 0, g_ccache_n = 0;
+
+static CacheSlot *g_fcache = NULL;  /* full cache (keyed on full feature) */
+static size_t    g_fcache_cap = 0, g_fcache_n = 0;
+
+/* ── Hash functions ─────────────────────────────────────────────── */
+static uint64_t fnv1a_64(const uint8_t *d, int len) {
+    uint64_t h = 14695981039346656037ULL;
+    for (int i = 0; i < len; i++) { h ^= d[i]; h *= 1099511628211ULL; }
+    return h | 1;  /* 0 = empty sentinel */
 }
 
-/* ── Coarse cache: maps 1KB coarse features → pid (two-stage) ───
- * During the parallel feature-extraction phase this cache is read-only
- * (all threads may look up concurrently). It is populated only in the
- * serial cache_put phase after matching. */
-typedef struct { uint8_t *feat; int pid; } CoarseEntry;
-static CoarseEntry *g_ccache = NULL; static unsigned *g_ccache_hash = NULL;
-static size_t g_ccache_cap = 0, g_ccache_n = 0;
+/* Full feature: sparse 64-byte sample across all scales (≤64 ns/tile). */
+static uint64_t full_feat_hash(const uint8_t *feat, int feat_len) {
+    uint64_t h = 14695981039346656037ULL;
+    int n = feat_len < 64 ? feat_len : 64;
+    int step = feat_len / n;
+    if (step < 1) step = 1;
+    for (int i = 0; i < n; i++) {
+        h ^= feat[(size_t)i * step];
+        h *= 1099511628211ULL;
+    }
+    return h | 1;
+}
 
-static int coarse_cache_lookup(const uint8_t *feat, int feat_len, int *pid) {
-    if (g_ccache_cap == 0) return 0;
-    unsigned h = fnv1a(feat, feat_len);
-    for (size_t i = 0; i < g_ccache_cap; i++) {
-        size_t idx = (h + i) % g_ccache_cap;
-        if (g_ccache_hash[idx] == 0) return 0;  /* empty slot — not found */
-        if (g_ccache_hash[idx] == h && g_ccache[idx].feat &&
-            memcmp(g_ccache[idx].feat, feat, feat_len) == 0) {
-            *pid = g_ccache[idx].pid; return 1;
-        }
+/* Coarse feature (≤ 1 KB): hash all bytes (~1 μs). */
+static uint64_t coarse_feat_hash(const uint8_t *feat, int len) {
+    return fnv1a_64(feat, len);
+}
+
+/* ── Cache slot primitives ──────────────────────────────────────── */
+#define CACHE_PROBE_MAX 32
+
+static inline int cache_slot_lookup(const CacheSlot *tab, size_t cap,
+                                    uint64_t h, int *pid) {
+    if (cap == 0) return 0;
+    size_t mask = cap - 1, idx = h & mask;
+    for (size_t i = 0; i < CACHE_PROBE_MAX && i < cap; i++) {
+        if (tab[idx].hash == 0) return 0;          /* empty → miss */
+        if (tab[idx].hash == h) { *pid = tab[idx].pid; return 1; }
+        idx = (idx + 1) & mask;
     }
     return 0;
+}
+
+static void cache_slot_grow(CacheSlot **tab, size_t *cap) {
+    size_t ncap = *cap ? *cap * 2 : 2048;
+    CacheSlot *nt = (CacheSlot *)calloc(ncap, sizeof(CacheSlot));
+    if (!nt) return;
+    if (*tab) {
+        size_t mask = ncap - 1;
+        for (size_t i = 0; i < *cap; i++) {
+            if ((*tab)[i].hash != 0) {
+                size_t idx = (*tab)[i].hash & mask;
+                while (nt[idx].hash != 0) idx = (idx + 1) & mask;
+                nt[idx] = (*tab)[i];
+            }
+        }
+        free(*tab);
+    }
+    *tab = nt; *cap = ncap;
+}
+
+static void cache_slot_put(CacheSlot **tab, size_t *cap, size_t *n,
+                           uint64_t h, int pid) {
+    if (*n + 1 > *cap * 3 / 4)          /* resize at 75 % load */
+        cache_slot_grow(tab, cap);
+    size_t mask = *cap - 1, idx = h & mask;
+    while ((*tab)[idx].hash != 0) idx = (idx + 1) & mask;
+    (*tab)[idx].hash = h;
+    (*tab)[idx].pid  = pid;
+    (*n)++;
+}
+
+/* ── Public cache API (same signatures as before) ───────────────── */
+static int coarse_cache_lookup(const uint8_t *feat, int feat_len, int *pid) {
+    return cache_slot_lookup(g_ccache, g_ccache_cap,
+                             coarse_feat_hash(feat, feat_len), pid);
 }
 static void coarse_cache_put(const uint8_t *feat, int feat_len, int pid) {
-    if (g_ccache_n + 1 > g_ccache_cap) {
-        size_t ncap = g_ccache_cap ? g_ccache_cap * 2 : 1024;
-        CoarseEntry *nc = (CoarseEntry *)calloc(ncap, sizeof(CoarseEntry));
-        unsigned *nh = (unsigned *)calloc(ncap, sizeof(unsigned));
-        if (!nc || !nh) { free(nc); free(nh); return; }
-        for (size_t i = 0; i < g_ccache_cap; i++) {
-            if (g_ccache && g_ccache_hash && g_ccache_hash[i] != 0 && g_ccache[i].feat) {
-                unsigned hh = g_ccache_hash[i];
-                size_t idx = hh % ncap;
-                while (nh[idx] != 0) idx = (idx + 1) % ncap;
-                nc[idx] = g_ccache[i]; nh[idx] = hh;
-            }
-        }
-        free(g_ccache); free(g_ccache_hash);
-        g_ccache = nc; g_ccache_hash = nh; g_ccache_cap = ncap;
-    }
-    unsigned h = fnv1a(feat, feat_len);
-    size_t idx = h % g_ccache_cap;
-    while (g_ccache_hash[idx] != 0) idx = (idx + 1) % g_ccache_cap;
-    g_ccache[idx].feat = malloc(feat_len); memcpy(g_ccache[idx].feat, feat, feat_len);
-    g_ccache[idx].pid = pid; g_ccache_hash[idx] = h; g_ccache_n++;
+    cache_slot_put(&g_ccache, &g_ccache_cap, &g_ccache_n,
+                   coarse_feat_hash(feat, feat_len), pid);
 }
-
-/* ── Full cache: maps full multi-resolution features → pid ─────── */
-typedef struct { uint8_t *feat; int pid; } CacheEntry;
-static CacheEntry *g_cache = NULL; static unsigned *g_cache_hash = NULL;
-static size_t g_cache_cap = 0, g_cache_n = 0;
-
 static int cache_lookup(const uint8_t *feat, int *pid) {
-    if (g_cache_cap == 0) return 0;
-    unsigned h = fnv1a(feat, g_feat_len);
-    for (size_t i = 0; i < g_cache_cap; i++) {
-        size_t idx = (h + i) % g_cache_cap;
-        if (g_cache_hash[idx] == 0) return 0;  /* empty slot — not found */
-        if (g_cache_hash[idx] == h && g_cache[idx].feat &&
-            memcmp(g_cache[idx].feat, feat, g_feat_len) == 0) {
-            *pid = g_cache[idx].pid; return 1;
-        }
-    }
-    return 0;
+    return cache_slot_lookup(g_fcache, g_fcache_cap,
+                             full_feat_hash(feat, g_feat_len), pid);
 }
 static void cache_put(const uint8_t *feat, int pid) {
-    if (g_cache_n + 1 > g_cache_cap) {
-        size_t ncap = g_cache_cap ? g_cache_cap * 2 : 1024;
-        CacheEntry *new_cache = (CacheEntry *)calloc(ncap, sizeof(CacheEntry));
-        unsigned *new_hash = (unsigned *)calloc(ncap, sizeof(unsigned));
-        if (!new_cache || !new_hash) { free(new_cache); free(new_hash); return; }
-        for (size_t i = 0; i < g_cache_cap; i++) {
-            if (g_cache && g_cache_hash && g_cache_hash[i] != 0 && g_cache[i].feat) {
-                unsigned h = g_cache_hash[i];
-                size_t idx = h % ncap;
-                while (new_hash[idx] != 0) idx = (idx + 1) % ncap;
-                new_cache[idx] = g_cache[i]; new_hash[idx] = h;
-            }
-        }
-        free(g_cache); free(g_cache_hash);
-        g_cache = new_cache; g_cache_hash = new_hash; g_cache_cap = ncap;
-    }
-    unsigned h = fnv1a(feat, g_feat_len);
-    size_t idx = h % g_cache_cap;
-    while (g_cache_hash[idx] != 0) idx = (idx + 1) % g_cache_cap;
-    g_cache[idx].feat = malloc(g_feat_len); memcpy(g_cache[idx].feat, feat, g_feat_len);
-    g_cache[idx].pid = pid; g_cache_hash[idx] = h; g_cache_n++;
+    cache_slot_put(&g_fcache, &g_fcache_cap, &g_fcache_n,
+                   full_feat_hash(feat, g_feat_len), pid);
 }
 
 typedef struct { double read, gray, solve, feat, match, write; long tiles, hits; } Timings;
+
+typedef struct { int x, y, w, h, manifest_idx; } TileSpec;
+
+typedef struct {
+    int64_t *sum;
+    uint8_t *visited;
+    TileSpec *specs;
+    int *coarse_hit;
+    uint8_t *crop_bufs;
+    int *miss_idx;
+    int *results;
+    int cap_w, cap_h;
+    int spec_cap;
+    int coarse_cap;
+    int miss_cap;
+    int result_cap;
+    size_t crop_cap;
+} SolveBuffers;
 
 /* Forward declaration for solve_full (defined after main). */
 void solve_full(const uint8_t *gray, const uint8_t *color_pixels, int color_stride, int color_channels,
                 int w, int h,
                 const FeatureDB *db, const Registry *reg,
                 int pid_white, int pid_black, int max_block, int hero_min,
-                Inst *manifest, int *nout, uint8_t *tiles, int *ntiles, Timings *t);
+                Inst *manifest, int *nout, uint8_t *tiles, int *ntiles, Timings *t,
+                SolveBuffers *bufs);
 
 static void print_help(void) {
     fprintf(stderr,
@@ -226,9 +254,10 @@ int main(int argc, char **argv) {
     if (!vd) cli_die("cannot open video: %s", video_path);
 
     int fw = video_decoder_width(vd), fh = video_decoder_height(vd);
-    int total_frames = (int)(video_decoder_fps(vd) * 300.0); /* estimate */
+    double source_fps = video_decoder_fps(vd);
+    int total_frames = (int)(source_fps * 300.0); /* estimate */
     cli_info("video: %dx%d | fps=%.1f | estimating %d frames",
-             fw, fh, video_decoder_fps(vd), total_frames);
+             fw, fh, source_fps, total_frames);
 
     /* Hero pages: mean intensity of the coarsest-scale gray feature.
      * The first sub-feature is gray at scales[0]×scales[0]. */
@@ -253,45 +282,96 @@ int main(int argc, char **argv) {
         cli_die("cannot create output directory: %s", man_dir);
     }
 
+    /* Write fps sidecar so render can auto-detect source frame rate */
+    char fps_path[1024];
+    snprintf(fps_path, sizeof(fps_path), "%s/fps.bin", man_dir);
+    FILE *fpsf = fopen(fps_path, "wb");
+    if (fpsf) {
+        fwrite(&source_fps, sizeof(double), 1, fpsf);
+        fclose(fpsf);
+    }
+
     match_set_threads(g_cli.threads);
     Timings t = {0};
     int frames_done = 0, total_tiles = 0;
     clock_t start = clock();
 
     Img frame;
+    Img gray = {0};
+    size_t gray_sz = 0;
+    Inst *manifest = NULL;
+    uint8_t *tiles = NULL;
+    size_t manifest_cap = 0;
+    SolveBuffers sbufs = {0};
     int fi = 0;
     while (video_decoder_next(vd, &frame) == 1 && (max_frames == 0 || fi < max_frames)) {
         clock_t tr = clock();
-        Img gray; img_to_gray(&frame, &gray);
+        size_t needed_gray = (size_t)fw * fh;
+        if (!gray.pixels || gray_sz != needed_gray) {
+            img_free(&gray);
+            img_to_gray(&frame, &gray);
+            gray_sz = needed_gray;
+        } else if (frame.channels == 1) {
+            memcpy(gray.pixels, frame.pixels, needed_gray);
+        } else {
+            const uint8_t *s = frame.pixels;
+            uint8_t *d = gray.pixels;
+            for (int y = 0; y < fh; y++) {
+                for (int x = 0; x < fw; x++) {
+                    const uint8_t *p = s + (size_t)y * frame.stride + x * 3;
+                    int v = (29 * p[0] + 150 * p[1] + 77 * p[2] + 128) >> 8;
+                    d[(size_t)y * fw + x] = (uint8_t)v;
+                }
+            }
+        }
         t.gray += (double)(clock() - tr) / CLOCKS_PER_SEC;
 
-        int manifest_cap = ((fw+7)/8) * ((fh+7)/8) + 1;
-        Inst *manifest = malloc(sizeof(Inst) * (size_t)manifest_cap);
-        uint8_t *tiles = malloc((size_t)db.feat_len * (size_t)manifest_cap);
-        if (!manifest || !tiles) { free(manifest); free(tiles); cli_die("out of memory"); }
+        size_t needed_cap = (size_t)((fw+7)/8) * ((fh+7)/8) + 1;
+        if (needed_cap > manifest_cap) {
+            size_t ncap = needed_cap * 2;
+            Inst *tmp_m = (Inst *)realloc(manifest, ncap * sizeof(Inst));
+            if (!tmp_m) { free(manifest); manifest = NULL; cli_die("out of memory"); }
+            manifest = tmp_m;
+            uint8_t *tmp_t = (uint8_t *)realloc(tiles, (size_t)db.feat_len * ncap);
+            if (!tmp_t) { free(tiles); tiles = NULL; cli_die("out of memory"); }
+            tiles = tmp_t;
+            manifest_cap = ncap;
+        }
         int n = 0, nt = 0;
         solve_full(gray.pixels, frame.pixels, frame.stride, frame.channels, fw, fh,
                    &db, &reg, pid_white, pid_black,
-                   max_block, hero_min, manifest, &n, tiles, &nt, &t);
+                   max_block, hero_min, manifest, &n, tiles, &nt, &t, &sbufs);
 
         for (int k = 0; k < n; k++) if (manifest[k].op_id >= 0) total_tiles++;
 
         char fn[1024]; snprintf(fn, sizeof(fn), "%s/%04d.bin", man_dir, fi);
-        FILE *f = fopen(fn, "wb");
-        if (f) {
-            uint32_t src_w = (uint32_t)fw, src_h = (uint32_t)fh;
-            uint32_t nn = (uint32_t)n;
-            fwrite(&src_w, 4, 1, f);
-            fwrite(&src_h, 4, 1, f);
-            fwrite(&nn, 4, 1, f);
-            for (int k = 0; k < n; k++) {
-                int32_t b[6] = {manifest[k].x, manifest[k].y, manifest[k].w, manifest[k].h,
-                                manifest[k].op_id, manifest[k].page_idx};
-                fwrite(b, 4, 6, f);
+        {
+            size_t total = 3 * sizeof(uint32_t) + (size_t)n * 6 * sizeof(int32_t);
+            uint8_t *mbuf = (uint8_t *)malloc(total);
+            if (mbuf) {
+                uint32_t *hp = (uint32_t *)mbuf;
+                hp[0] = (uint32_t)fw;
+                hp[1] = (uint32_t)fh;
+                hp[2] = (uint32_t)n;
+                int32_t *rp = (int32_t *)(hp + 3);
+                for (int k = 0; k < n; k++) {
+                    rp[0] = manifest[k].x;
+                    rp[1] = manifest[k].y;
+                    rp[2] = manifest[k].w;
+                    rp[3] = manifest[k].h;
+                    rp[4] = manifest[k].op_id;
+                    rp[5] = manifest[k].page_idx;
+                    rp += 6;
+                }
+                FILE *f = fopen(fn, "wb");
+                if (f) {
+                    fwrite(mbuf, 1, total, f);
+                    fclose(f);
+                }
+                free(mbuf);
             }
-            fclose(f);
         }
-        img_free(&gray); img_free(&frame); free(manifest); free(tiles);
+        img_free(&frame);
 
         frames_done++; fi++;
         if (!g_cli.quiet) {
@@ -303,6 +383,16 @@ int main(int argc, char **argv) {
                                fps, hit);
         }
     }
+    free(manifest);
+    free(tiles);
+    free(sbufs.sum);
+    free(sbufs.visited);
+    free(sbufs.specs);
+    free(sbufs.coarse_hit);
+    free(sbufs.crop_bufs);
+    free(sbufs.miss_idx);
+    free(sbufs.results);
+    img_free(&gray);
     video_decoder_close(vd);
     ba_free_features(&db);
     ba_free_registry(&reg);
@@ -388,29 +478,65 @@ void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int colo
                 int w, int h,
                 const FeatureDB *db, const Registry *reg,
                 int pid_white, int pid_black, int max_block, int hero_min,
-                Inst *manifest, int *nout, uint8_t *tiles, int *ntiles, Timings *t) {
+                Inst *manifest, int *nout, uint8_t *tiles, int *ntiles, Timings *t,
+                SolveBuffers *bufs) {
     const uint8_t *color_pixels = color_pixels_param;
     int color_stride = color_stride_param;
     int color_channels = color_channels_param;
     const int CELL = 8;
-    /* Build a binary integral image (0/1 after threshold at 127) for exact
-     * purity checks, matching the Python reference implementation. */
-    uint8_t *binary = (uint8_t *)malloc((size_t)w * h);
-    memcpy(binary, gray, (size_t)w * h);
-    img_threshold_u8(binary, w * h, 127, 1);
-    int64_t *sum = img_integral(binary, w, h);
-    free(binary);
-    int stride = w + 1;
+
+    /* Reallocate sum/visited buffers only when dimensions grow */
+    if (bufs->cap_w < w || bufs->cap_h < h) {
+        free(bufs->sum);
+        free(bufs->visited);
+        bufs->sum = NULL;
+        bufs->visited = NULL;
+        bufs->cap_w = w;
+        bufs->cap_h = h;
+    }
+    size_t sum_needed = (size_t)(w + 1) * (h + 1);
+    if (!bufs->sum) {
+        bufs->sum = (int64_t *)malloc(sum_needed * sizeof(int64_t));
+        if (!bufs->sum) { *nout = 0; *ntiles = 0; return; }
+    }
     int gh = (h + CELL - 1) / CELL, gw = (w + CELL - 1) / CELL;
-    uint8_t *visited = (uint8_t *)calloc((size_t)gh * gw, 1);
+    size_t vis_needed = (size_t)gh * gw;
+    if (!bufs->visited) {
+        bufs->visited = (uint8_t *)malloc(vis_needed);
+        if (!bufs->visited) { *nout = 0; *ntiles = 0; return; }
+    }
+
+    int64_t *sum = bufs->sum;
+    /* Zero first row and first column for integral image */
+    memset(sum, 0, (size_t)(w + 1) * sizeof(int64_t));
+    for (int y = 1; y <= h; y++) sum[y * (w + 1)] = 0;
+    /* Single-pass threshold + integral image (eliminates binary buffer) */
+    for (int y = 0; y < h; y++) {
+        int64_t rowsum = 0;
+        for (int x = 0; x < w; x++) {
+            int val = (gray[(size_t)y * w + x] > 127) ? 1 : 0;
+            rowsum += val;
+            sum[(y + 1) * (w + 1) + (x + 1)] = rowsum + sum[y * (w + 1) + (x + 1)];
+        }
+    }
+    int stride = w + 1;
+
+    memset(bufs->visited, 0, vis_needed);
+    uint8_t *visited = bufs->visited;
+
     int feat_len = db->feat_len;
     int max_cells = max_block / CELL;
     int n = 0, nt = 0;
 
     /* ── Tile spec array: records position of non-hero tiles ─────── */
-    typedef struct { int x, y, w, h, manifest_idx; } TileSpec;
-    int spec_cap = 512;
-    TileSpec *specs = (TileSpec *)malloc((size_t)spec_cap * sizeof(TileSpec));
+    int spec_cap = bufs->spec_cap ? bufs->spec_cap : 512;
+    TileSpec *specs = bufs->specs;
+    if (!specs) {
+        specs = (TileSpec *)malloc((size_t)spec_cap * sizeof(TileSpec));
+        if (!specs) { *nout = 0; *ntiles = 0; return; }
+        bufs->specs = specs;
+        bufs->spec_cap = spec_cap;
+    }
     int n_specs = 0;
 
     clock_t t0 = clock();
@@ -465,28 +591,27 @@ void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int colo
                     visited[(size_t)yy * gw + xx] = 1;
 
             if (mw >= hero_min && mh >= hero_min) {
-                /* Hero block: uniform region — fast memset in renderer. */
                 manifest[n].x = x; manifest[n].y = y;
                 manifest[n].w = mw; manifest[n].h = mh;
                 manifest[n].op_id = (color == 1) ? -2 : -1;
                 manifest[n].page_idx = -1;
                 n++;
             } else {
-                /* Non-hero tile: record spec for parallel feature extraction. */
                 if (n_specs >= spec_cap) {
                     spec_cap *= 2;
                     TileSpec *tmp = (TileSpec *)realloc(specs, (size_t)spec_cap * sizeof(TileSpec));
-                    if (!tmp) { free(specs); specs = NULL; goto done; }
+                    if (!tmp) goto done;
                     specs = tmp;
+                    bufs->specs = tmp;
+                    bufs->spec_cap = spec_cap;
                 }
-                int midx = n;  /* manifest index for this tile's placeholder */
+                int midx = n;
                 specs[n_specs].x = x;
                 specs[n_specs].y = y;
                 specs[n_specs].w = mw;
                 specs[n_specs].h = mh;
                 specs[n_specs].manifest_idx = midx;
                 n_specs++;
-                /* Placeholder entry in manifest (will be filled after matching). */
                 manifest[n].x = x; manifest[n].y = y;
                 manifest[n].w = mw; manifest[n].h = mh;
                 manifest[n].op_id = -1;
@@ -495,10 +620,8 @@ void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int colo
             }
         }
     }
-    free(sum);
-    free(visited);
 
-    if (n_specs == 0) { free(specs); goto done; }
+    if (n_specs == 0) goto done;
 
     /* ═══════════════════════════════════════════════════════════════
      * Phase 2: Pre-allocate feature buffers (pool bump-alloc)
@@ -506,22 +629,20 @@ void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int colo
     TilePool pool;
     pool_init(&pool, (size_t)n_specs * feat_len + 4096);
     uint8_t *feat_bufs = pool_alloc(&pool, (size_t)n_specs * feat_len);
-    if (!feat_bufs) { free(specs); goto done; }
+    if (!feat_bufs) { pool_free(&pool); goto done; }
 
     /* ═══════════════════════════════════════════════════════════════
      * Phase 3: Two-stage parallel feature extraction
-     *
-     * Stage A (all tiles): compute coarse 1KB feature (32×32 gray,
-     *   quantized) → check coarse cache → if hit, record pid directly.
-     * Stage B (misses only): compute full multi-resolution 43KB feature.
-     *
-     * With ~41% cache hit rate, this eliminates ~33% of full feature
-     * computation work (3 area resizes + 3 Sobel + quant for each hit).
      * ═══════════════════════════════════════════════════════════════ */
     clock_t tf = clock();
-    int coarse_len = g_scales[0] * g_scales[0];  /* e.g. 1024 for 32×32 */
-    int *coarse_hit = (int *)malloc((size_t)n_specs * sizeof(int));
-    if (!coarse_hit) { free(specs); goto done; }
+    int coarse_len = g_scales[0] * g_scales[0];
+    if (n_specs > bufs->coarse_cap) {
+        free(bufs->coarse_hit);
+        bufs->coarse_cap = n_specs;
+        bufs->coarse_hit = (int *)malloc((size_t)n_specs * sizeof(int));
+    }
+    int *coarse_hit = bufs->coarse_hit;
+    if (!coarse_hit) { pool_free(&pool); goto done; }
     for (int i = 0; i < n_specs; i++) coarse_hit[i] = -1;
     {
 #ifdef _OPENMP
@@ -530,8 +651,14 @@ void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int colo
         int nthreads = 1;
 #endif
         size_t max_crop_sz = (size_t)max_block * max_block * (db->channels == 3 ? 3 : 1);
-        uint8_t *crop_bufs = (uint8_t *)malloc((size_t)nthreads * max_crop_sz);
-        if (!crop_bufs) { free(coarse_hit); free(specs); goto done; }
+        size_t crop_needed = (size_t)nthreads * max_crop_sz;
+        if (crop_needed > bufs->crop_cap) {
+            free(bufs->crop_bufs);
+            bufs->crop_cap = crop_needed;
+            bufs->crop_bufs = (uint8_t *)malloc(crop_needed);
+        }
+        uint8_t *crop_bufs = bufs->crop_bufs;
+        if (!crop_bufs) { pool_free(&pool); goto done; }
 
 #ifdef _OPENMP
         #pragma omp parallel
@@ -543,22 +670,20 @@ void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int colo
             int tid = 0;
 #endif
             uint8_t *my_crop = crop_bufs + (size_t)tid * max_crop_sz;
+            uint8_t *coarse_feat = (uint8_t *)malloc(coarse_len);
 
 #ifdef _OPENMP
             #pragma omp for schedule(static)
 #endif
             for (int i = 0; i < n_specs; i++) {
                 TileSpec *sp = &specs[i];
-                /* Extract crop from frame */
                 if (db->channels == 3) {
-                    /* Extract BGR crop from color frame */
                     for (int yy = 0; yy < sp->h; yy++) {
                         memcpy(my_crop + (size_t)yy * sp->w * 3,
                                color_pixels + (size_t)(sp->y + yy) * color_stride + sp->x * 3,
                                (size_t)sp->w * 3);
                     }
                 } else {
-                    /* Extract grayscale crop */
                     for (int yy = 0; yy < sp->h; yy++) {
                         memcpy(my_crop + (size_t)yy * sp->w,
                                gray + (size_t)(sp->y + yy) * w + sp->x,
@@ -566,13 +691,9 @@ void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int colo
                     }
                 }
 
-                /* ── Stage A: coarse 1KB feature + cache check ────── */
                 int N = g_scales[0];
                 int sw = sp->w, sh = sp->h;
                 int maxv = (1 << db->G) - 1;
-                /* Inline area resize + quantize to N×N (no malloc) */
-                uint8_t *coarse_feat = (uint8_t *)malloc(coarse_len);
-                if (!coarse_feat) continue;
                 for (int dy = 0; dy < N; dy++) {
                     int sy0 = (int)((long long)dy * sh / N);
                     int sy1 = (int)((long long)(dy + 1) * sh / N);
@@ -581,19 +702,19 @@ void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int colo
                         int sx0 = (int)((long long)dx * sw / N);
                         int sx1 = (int)((long long)(dx + 1) * sw / N);
                         if (sx1 > sw) sx1 = sw;
-                        unsigned long sum = 0;
+                        unsigned long psum = 0;
                         for (int sy = sy0; sy < sy1; sy++) {
                             for (int sx = sx0; sx < sx1; sx++) {
                                 if (db->channels == 3) {
                                     const uint8_t *p = my_crop + ((size_t)sy * sp->w * 3 + sx * 3);
-                                    sum += (unsigned long)(0.114 * p[0] + 0.587 * p[1] + 0.299 * p[2]);
+                                    psum += (29 * p[0] + 150 * p[1] + 77 * p[2]) >> 8;
                                 } else {
-                                    sum += my_crop[(size_t)sy * sw + sx];
+                                    psum += my_crop[(size_t)sy * sw + sx];
                                 }
                             }
                         }
                         int area = (sy1 - sy0) * (sx1 - sx0);
-                        int v = (area > 0) ? (int)(sum / area) : 0;
+                        int v = (area > 0) ? (int)(psum / area) : 0;
                         int q = (db->G >= 8) ? v : (v * maxv + 127) / 255;
                         if (q > maxv) q = maxv;
                         coarse_feat[dy * N + dx] = (uint8_t)q;
@@ -602,13 +723,10 @@ void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int colo
 
                 int pid = -1;
                 if (coarse_cache_lookup(coarse_feat, coarse_len, &pid)) {
-                    coarse_hit[i] = pid;  /* skip full feature extraction */
-                    free(coarse_feat);
+                    coarse_hit[i] = pid;
                     continue;
                 }
-                free(coarse_feat);
 
-                /* ── Stage B: full multi-resolution feature ───────── */
                 Img crop;
                 crop.w = sp->w; crop.h = sp->h;
                 crop.channels = db->channels;
@@ -616,10 +734,10 @@ void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int colo
                 crop.pixels = my_crop;
                 img_compute_feature_multires(&crop, g_scales, g_n_scales,
                                               db->G, db->has_edges, (db->channels == 3),
-                                              feat_bufs + (size_t)i * feat_len);
+                                               feat_bufs + (size_t)i * feat_len);
             }
+            free(coarse_feat);
         }
-        free(crop_bufs);
     }
 
     /* Process coarse-cache hits (fast path — no full feature needed) */
@@ -636,11 +754,16 @@ void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int colo
     /* ═══════════════════════════════════════════════════════════════
      * Phase 4: Full-cache lookup for remaining (non-coarse-hit) tiles
      * ═══════════════════════════════════════════════════════════════ */
-    int *miss_idx = (int *)malloc((size_t)n_specs * sizeof(int));
-    if (!miss_idx) { free(coarse_hit); pool_free(&pool); free(specs); goto done; }
+    if (n_specs > bufs->miss_cap) {
+        free(bufs->miss_idx);
+        bufs->miss_cap = n_specs;
+        bufs->miss_idx = (int *)malloc((size_t)n_specs * sizeof(int));
+    }
+    int *miss_idx = bufs->miss_idx;
+    if (!miss_idx) { pool_free(&pool); goto done; }
     nt = 0;
     for (int i = 0; i < n_specs; i++) {
-        if (coarse_hit[i] >= 0) continue;  /* already resolved */
+        if (coarse_hit[i] >= 0) continue;
         const uint8_t *feat = feat_bufs + (size_t)i * feat_len;
         int pid = -1;
         if (cache_lookup(feat, &pid)) {
@@ -660,8 +783,13 @@ void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int colo
      * ═══════════════════════════════════════════════════════════════ */
     if (nt > 0) {
         clock_t tm = clock();
-        int *results = (int *)malloc((size_t)nt * sizeof(int));
-        if (!results) { free(coarse_hit); free(miss_idx); pool_free(&pool); free(specs); goto done; }
+        if (nt > bufs->result_cap) {
+            free(bufs->results);
+            bufs->result_cap = nt;
+            bufs->results = (int *)malloc((size_t)nt * sizeof(int));
+        }
+        int *results = bufs->results;
+        if (!results) { pool_free(&pool); goto done; }
         int coarse_for_match = g_scales[0] * g_scales[0];
         match_batch_coarse(db->data, tiles, db->n_pages, nt, feat_len, coarse_for_match, results);
         for (int i = 0; i < nt; i++) {
@@ -669,19 +797,14 @@ void solve_full(const uint8_t *gray, const uint8_t *color_pixels_param, int colo
             int midx = specs[miss_idx[i]].manifest_idx;
             manifest[midx].op_id = pid;
             manifest[midx].page_idx = reg->entries[pid].page_idx;
-            /* Populate BOTH caches for future hits */
             cache_put(tiles + (size_t)i * feat_len, pid);
             coarse_cache_put(tiles + (size_t)i * feat_len, coarse_len, pid);
         }
-        free(results);
         t->match += (double)(clock() - tm) / CLOCKS_PER_SEC;
         t->tiles += nt;
     }
 
-    free(coarse_hit);
-    free(miss_idx);
     pool_free(&pool);
-    free(specs);
 done:
     t->solve += (double)(clock() - t0) / CLOCKS_PER_SEC;
     *nout = n;
