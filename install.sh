@@ -1,5 +1,5 @@
 #!/bin/sh
-# Usage: curl -fsSL https://raw.githubusercontent.com/frobinson/BadApplestein/master/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/TheFirstIstari/BadApplestein/master/install.sh | sh
 #
 # Install the unified BadApplestein binary from GitHub Releases.
 # Creates backward-compatible symlinks for 'arrange' and 'render'.
@@ -10,7 +10,7 @@
 #
 set -e
 
-REPO="frobinson/BadApplestein"
+REPO="TheFirstIstari/BadApplestein"
 BIN_NAME="badapplestein"
 DEFAULT_VERSION="latest"
 DEFAULT_BIN_DIR="$HOME/.local/bin"

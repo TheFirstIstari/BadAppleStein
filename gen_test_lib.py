@@ -609,8 +609,8 @@ def main():
 
     print()
     print("To use this library:")
-    print(f"  python arrange.py --video <video> --features {feat_path} --registry {reg_path}")
-    print(f"  MISE_FEATURES={feat_path} MISE_REGISTRY={reg_path} mise run arrange -- <video>")
+    print(f"  badapplestein encode <video> output.mov --features {feat_path} --registry {reg_path}")
+    print(f"  badapplestein build <sources_dir> --library .")
 
     return 0
 

@@ -744,7 +744,9 @@ int render_main(int argc, char **argv) {
         snprintf(fps_path, sizeof(fps_path), "%s/fps.bin", man_dir);
         FILE *fpsf = fopen(fps_path, "rb");
         if (fpsf) {
-            fread(&src_fps, sizeof(double), 1, fpsf);
+            if (fread(&src_fps, sizeof(double), 1, fpsf) != 1) {
+                src_fps = 0.0;
+            }
             fclose(fpsf);
         }
         if (fps <= 0.0) {

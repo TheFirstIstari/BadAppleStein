@@ -1,7 +1,7 @@
 class Badapplestein < Formula
   desc "Reconstruct any video as a mosaic of source library pages"
-  homepage "https://github.com/frobinson/BadApplestein"
-  url "https://github.com/frobinson/BadApplestein/archive/refs/tags/v1.0.0.tar.gz"
+  homepage "https://github.com/TheFirstIstari/BadApplestein"
+  url "https://github.com/TheFirstIstari/BadApplestein/archive/refs/tags/v1.0.0.tar.gz"
   version "1.0.0"
   license "MIT"
 
