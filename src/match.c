@@ -152,7 +152,7 @@ static inline uint32_t feature_l1_bounded(const uint8_t* a, const uint8_t* b,
             uint64_t parts[2];
             _mm_storeu_si128((__m128i*)parts, sum128);
             uint64_t s = parts[0] + parts[1];
-            if (s > bound) return bound + 1;
+            if (s > bound) return (uint32_t)(s > 0xFFFFFFFF ? 0xFFFFFFFF : s);
         }
     }
     __m128i lo = _mm256_castsi256_si128(acc);
@@ -179,7 +179,7 @@ static inline uint32_t feature_l1_bounded(const uint8_t* a, const uint8_t* b,
         /* Check every 4 iterations (64 bytes) to amortize hsum cost. */
         if (((j + 16) % 64) == 0) {
             uint32_t s = vaddvq_u32(acc);
-            if (s > bound) return bound + 1;
+            if (s > bound) return s;
         }
     }
     uint32_t s = vaddvq_u32(acc);
