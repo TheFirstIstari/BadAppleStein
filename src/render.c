@@ -827,7 +827,13 @@ int render_main(int argc, char **argv) {
     EncodePipeline ep;
     pipeline_init(&ep, ve, vt, width, height, channels, canvas_bytes);
     pthread_t enc_thread;
-    pthread_create(&enc_thread, NULL, encoder_thread, &ep);
+    int inprocess = 0;
+    int err = pthread_create(&enc_thread, NULL, encoder_thread, &ep);
+    if (err != 0) {
+        inprocess = 1;
+        cli_warn("pthread_create failed (%s), falling back to in-process encoding",
+                 strerror(err));
+    }
 
     /* ── Process frames ───────────────────────────────────────── */
     int frames_done = 0;
@@ -945,7 +951,22 @@ int render_main(int argc, char **argv) {
         }
 
         /* ── Push assembled frame to encoder pipeline ──────────────── */
-        pipeline_push(&ep, canvas, canvas_bytes);
+        if (inprocess) {
+            /* In-process encoding: encode directly without pipeline */
+            if (vt) {
+                vt_prores_write(vt, canvas, width, height,
+                                width * channels, channels);
+            } else {
+                Img frame;
+                frame.w = width; frame.h = height;
+                frame.channels = channels;
+                frame.stride = width * channels;
+                frame.pixels = canvas;
+                video_encoder_write(ve, &frame);
+            }
+        } else {
+            pipeline_push(&ep, canvas, canvas_bytes);
+        }
 
         frames_done++;
         if (!g_cli.quiet && frames_done % 30 == 0) {
@@ -960,8 +981,10 @@ int render_main(int argc, char **argv) {
     }
 
     /* ── Flush encoder and join thread ─────────────────────────── */
-    pipeline_flush(&ep);
-    pthread_join(enc_thread, NULL);
+    if (!inprocess) {
+        pipeline_flush(&ep);
+        pthread_join(enc_thread, NULL);
+    }
 
     /* ── Cleanup ──────────────────────────────────────────────── */
     if (vt) vt_prores_close(vt);
