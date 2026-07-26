@@ -666,7 +666,13 @@ int render_main(int argc, char **argv) {
             if (!tmp) { free(manifest_paths); cli_die("out of memory"); }
             manifest_paths = tmp;
         }
-        manifest_paths[n_manifests++] = strdup(full);
+        char *dup = strdup(full);
+        if (!dup) {
+            for (int i = 0; i < n_manifests; i++) free(manifest_paths[i]);
+            free(manifest_paths);
+            cli_die("out of memory");
+        }
+        manifest_paths[n_manifests++] = dup;
     }
     closedir(d);
 
