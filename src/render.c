@@ -815,6 +815,9 @@ int render_main(int argc, char **argv) {
     }
 
     /* ── Single canvas buffer (pipeline_push copies into queue) ── */
+    if (width <= 0 || height <= 0) cli_die("invalid canvas dimensions: %dx%d", width, height);
+    if ((size_t)width > SIZE_MAX / (size_t)height ||
+        (size_t)width * (size_t)height > SIZE_MAX / (size_t)channels) cli_die("canvas dimensions overflow");
     size_t canvas_bytes = (size_t)width * (size_t)height * (size_t)channels;
     uint8_t *canvas = (uint8_t *)calloc(canvas_bytes, 1);
     if (!canvas) cli_die("cannot allocate canvas");
