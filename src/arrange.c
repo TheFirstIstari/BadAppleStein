@@ -18,9 +18,12 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <pthread.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+
+static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int g_G = 1, g_has_edges = 1, g_feat_len = 0;
 static int g_scales[16] = {32, 64, 128};
@@ -118,20 +121,30 @@ static void cache_slot_put(CacheSlot **tab, size_t *cap, size_t *n,
 
 /* ── Public cache API (same signatures as before) ───────────────── */
 static int coarse_cache_lookup(const uint8_t *feat, int feat_len, int *pid) {
-    return cache_slot_lookup(g_ccache, g_ccache_cap,
-                             coarse_feat_hash(feat, feat_len), pid);
+    pthread_mutex_lock(&g_cache_mutex);
+    int result = cache_slot_lookup(g_ccache, g_ccache_cap,
+                                     coarse_feat_hash(feat, feat_len), pid);
+    pthread_mutex_unlock(&g_cache_mutex);
+    return result;
 }
 static void coarse_cache_put(const uint8_t *feat, int feat_len, int pid) {
+    pthread_mutex_lock(&g_cache_mutex);
     cache_slot_put(&g_ccache, &g_ccache_cap, &g_ccache_n,
-                   coarse_feat_hash(feat, feat_len), pid);
+                     coarse_feat_hash(feat, feat_len), pid);
+    pthread_mutex_unlock(&g_cache_mutex);
 }
 static int cache_lookup(const uint8_t *feat, int *pid) {
-    return cache_slot_lookup(g_fcache, g_fcache_cap,
-                             full_feat_hash(feat, g_feat_len), pid);
+    pthread_mutex_lock(&g_cache_mutex);
+    int result = cache_slot_lookup(g_fcache, g_fcache_cap,
+                                     full_feat_hash(feat, g_feat_len), pid);
+    pthread_mutex_unlock(&g_cache_mutex);
+    return result;
 }
 static void cache_put(const uint8_t *feat, int pid) {
+    pthread_mutex_lock(&g_cache_mutex);
     cache_slot_put(&g_fcache, &g_fcache_cap, &g_fcache_n,
-                   full_feat_hash(feat, g_feat_len), pid);
+                     full_feat_hash(feat, g_feat_len), pid);
+    pthread_mutex_unlock(&g_cache_mutex);
 }
 
 typedef struct { double read, gray, solve, feat, match, write; long tiles, hits; } Timings;
@@ -428,6 +441,8 @@ int arrange_main(int argc, char **argv) {
         cli_json_field("tiles", jbuf);
         cli_json_end();
     }
+
+    pthread_mutex_destroy(&g_cache_mutex);
 
     return 0;
 }
